@@ -1,0 +1,6010 @@
+Index: WorldSocket.h
+===================================================================
+--- WorldSocket.h	(revision 824)
++++ WorldSocket.h	(working copy)
+@@ -20,8 +20,8 @@
+ #ifndef REALMSERVER_WORLDSOCKET_H
+ #define REALMSERVER_WORLDSOCKET_H
+ 
+-#define WORLDSOCKET_SENDBUF_SIZE 131078
+-#define WORLDSOCKET_RECVBUF_SIZE 16384
++#define WORLDSOCKET_SENDBUF_SIZE 262156
++#define WORLDSOCKET_RECVBUF_SIZE 32768
+ 
+ class WorldPacket;
+ class Session;
+@@ -66,6 +66,7 @@
+ 	WorldPacket * pAuthenticationPacket;
+ 	WowCrypt _crypt;
+ 	uint32 _latency;
++	Mutex delLock;
+ 
+ 	Session * m_session;
+ };
+Index: WorkerServer.h
+===================================================================
+--- WorkerServer.h	(revision 824)
++++ WorkerServer.h	(working copy)
+@@ -19,36 +19,76 @@
+ 
+ #define MAX_SESSIONS_PER_SERVER 1000
+ 
++enum WType {
++	WT_CONTINENT = 0,
++	WT_INSTANCE_WORLD = 1,
++	WT_BATTLEGROUP_WORLD = 2
++};
++
++enum LogoutSrc {
++	LS_DISCONNECT = 0,
++	LS_LOGOUT = 1
++};
++
+ struct Instance;
+ typedef void(WServer::*WServerHandler)(WorldPacket &);
++typedef void(WServer::*WServerHandlerW)(WorldPacket &, uint32);
+ 
+ class WServer
+ {
+ 	static WServerHandler PHandlers[IMSG_NUM_TYPES];
+ 	uint32 m_id;
+ 	WSSocket * m_socket;
+-	FastQueue<WorldPacket*, Mutex> m_recvQueue;
++	FastQueue<WorldPacket*, Mutex> m_recvQueue[2];
++	bool actQu;
+ 	list<Instance*> m_instances;
++	bool m_deleted;
++	uint32 lastPing;
++	uint32 lastPong;
+ 
+ public:
++	static WServerHandlerW WHandlers[NUM_MSG_TYPES];
+ 	static void InitHandlers();
+ 	WServer(uint32 id, WSSocket * s);
+ 	~WServer();
++	uint32 latency;
+ 
++	WType type;
+ 	ARCEMU_INLINE size_t GetInstanceCount() { return m_instances.size(); }
+ 	ARCEMU_INLINE void SendPacket(WorldPacket * data) { if(m_socket) m_socket->SendPacket(data); }
+ 	ARCEMU_INLINE void SendWoWPacket(Session * from, WorldPacket * data) { if(m_socket) m_socket->SendWoWPacket(from, data); }
+ 	ARCEMU_INLINE void AddInstance(Instance * pInstance) { m_instances.push_back(pInstance); }
+-	ARCEMU_INLINE void QueuePacket(WorldPacket * data) { m_recvQueue.Push(data); }
++	ARCEMU_INLINE void QueuePacket(WorldPacket * data) {lastPong = (uint32)UNIXTIME; m_recvQueue[!actQu].Push(data); }
+ 	ARCEMU_INLINE uint32 GetID() { return m_id; }
++	ARCEMU_INLINE WSSocket * GetSocket() { return m_socket; }
++	ARCEMU_INLINE void SetServerID(uint32 val) { m_id = val; }
++	ARCEMU_INLINE void SetDeleted() { m_deleted = true; }
++	ARCEMU_INLINE bool IsDeleted() { return m_deleted; }
++	ARCEMU_INLINE void SetSocket(WSSocket* val) { m_socket = val; }
++	void LogoutPlayer(uint32 session, LogoutSrc src);
+ 
+ 	void Update();
+ 
+ protected:
+ 	/* packet handlers */
++	void HandlePong(WorldPacket & pck);
+ 	void HandleRegisterWorker(WorldPacket & pck);
+ 	void HandleWoWPacket(WorldPacket & pck);
++	void HandleWoWPacket(uint32 op, uint32 sessionid, WorldPacket & pck);
+ 	void HandlePlayerLoginResult(WorldPacket & pck);
+-	void HandlePlayerLogout(WorldPacket & pck);
+ 	void HandleTeleportRequest(WorldPacket & pck);
++	void HandlePlayerChangeServerInfo(WorldPacket & pck);
++	//void HandlePlayerChangedServers(WorldPacket & pck);
++	void HandlePlayerInfoUpdate(WorldPacket & pck);
++	void HandleGuidIncrement(WorldPacket & pck);
++	void HandlePlayerCreated(WorldPacket & pck);
++	void HandleGuildDisband(WorldPacket & pck);
++	void HandleMailUpdate(WorldPacket & pck);
++	void HandleInstanceCreated(WorldPacket & pck);
++	void HandleGuildNameUpdate(WorldPacket & pck);
++	void HandlePartyUpdate(WorldPacket & pck);
++
++	//World handlers
++	void HandlePlayerLogout(WorldPacket & pck, uint32 session);
++	void HandleRollOps(WorldPacket & pck, uint32 session);
+ };
+Index: ClientManager.cpp
+===================================================================
+--- ClientManager.cpp	(revision 824)
++++ ClientManager.cpp	(working copy)
+@@ -23,53 +23,92 @@
+ 
+ ClientMgr::ClientMgr()
+ {
++	m_clients.clear();
++	m_groups.clear();
+ 	Session::InitHandlers();
++	bCharCreate = false;
+ 	m_maxSessionId = 0;
+ 	memset(m_sessions, 0, MAX_SESSIONS * sizeof(void*));
++	peakOnline = 0;
+ 	Log.Success("ClientMgr", "Interface Created");
+ }
+ 
+ ClientMgr::~ClientMgr()
+ {
+-
++	
+ };
+ 
++void ClientMgr::LoadGuildNames()
++{
++	QueryResult * result = CharacterDatabase.Query("SELECT guildId, guildName FROM guilds");
++	if(result)
++	{
++		do
++		{
++			Field * fields = result->Fetch();
++			m_guildNames.insert(make_pair(fields[0].GetUInt32(), fields[1].GetString()));
++		} while(result->NextRow());
++		Log.Notice("ClienMgr", "%u guild names loaded.", result->GetRowCount());
++		delete result;
++	}
++}
++
++void ClientMgr::LoadPlayerNames()
++{
++	QueryResult * result = CharacterDatabase.Query("SELECT guid, name FROM characters");
++	if(result)
++	{
++		do
++		{
++			Field * fields = result->Fetch();
++			m_plNames.insert(make_pair(fields[0].GetUInt32(), fields[1].GetString()));
++		} while(result->NextRow());
++		Log.Notice("ClienMgr", "%u player names loaded.", result->GetRowCount());
++		delete result;
++	}
++}
++
+ void ClientMgr::RemoveSession(uint32 id)
+ {
+ 	if (!m_sessions[id]) 
+ 		return;
+-	Log.Debug("ClientMgr", "Removing session id %u account %u", id, m_sessions[id]->GetAccountId());
+-	delete m_sessions[id];
+-	m_sessions[id] = NULL;
++	m_sessions[id]->SetDeleted();
+ }
+ 
++void ClientMgr::SendPlayerUpdate(uint32 guid, WServer * server)
++{
++	if (!GetRPlayer(guid))
++		return;
++
++	WorldPacket* data = new WorldPacket(ISMSG_PLAYER_INFO, 300);
++	GetRPlayer(guid)->Pack(*data);
++	sClusterMgr.DistributePacketToAll(data, server);
++}
++
+ void ClientMgr::SendPackedClientInfo(WServer * server)
+ {
+ 	if(!m_clients.size())
+ 		return;
+ 
+-	WorldPacket data(ISMSG_PACKED_PLAYER_INFO, sizeof(RPlayerInfo) * m_clients.size() + 4);
+-	data << uint32(m_clients.size());
+-
+ 	/* pack them all togther, w000t! */
+ 	ClientMap::iterator itr = m_clients.begin();
+ 	RPlayerInfo * pi;
+ 	for(; itr != m_clients.end(); ++itr)
+ 	{
+ 		pi = itr->second;
+-		pi->Pack(data);
++		WorldPacket* data = new WorldPacket(ISMSG_PLAYER_INFO, 300);
++		pi->Pack(*data);
++		server->SendPacket(data);
+ 	}
+-
+-    /* TODO: compress the packet */
+-	server->SendPacket(&data);
+ }
+ 
+-Session * ClientMgr::CreateSession(uint32 AccountId)
++void ClientMgr::InsertSession(Session* sess)
+ {
+ 	uint32 i = 0;
+ 	uint32 j = 1;
+ 
+ 	/* make sure nothing with this id exists already */
++	
+ 	for(; j < MAX_SESSIONS; ++j)
+ 	{
+ 		if(m_sessions[j] == 0)
+@@ -79,18 +118,22 @@
+ 		}
+ 		else
+ 		{
+-			if(m_sessions[j]->GetAccountId() == AccountId)
++			if(m_sessions[j]->GetAccountId() == sess->GetAccountId() && m_sessions[j]->GetSocket())
+ 			{
+-				Log.Error("ClientMgr", "Could not create session for account %u due to a session already existing from %s", AccountId, 
++				Log.Error("ClientMgr", "Could not create session for account %u due to a session already existing from %s", sess->GetAccountId(), 
+ 					m_sessions[j]->GetSocket()->GetRemoteIP().c_str());
+-
+-				return 0;
++				
++				sess->SafeRemove();
++				return;
+ 			}
+ 		}
+ 	}
+ 
+ 	if(i == 0)
+-		return 0;
++	{
++		sess->SafeRemove();
++		return;
++	}
+ 
+ 	if(m_maxSessionId < i)
+ 	{
+@@ -98,16 +141,49 @@
+ 		m_maxSessionId = i;
+ 	}
+ 
+-	Log.Debug("ClientMgr", "Allocating session %u for account id %u", i, AccountId);
+-	m_sessions[i] = new Session(i);
+-	return m_sessions[i];
++	Log.Debug("ClientMgr", "Allocating session %u for account id %u", i, sess->GetAccountId());
++	sess->SetSessionID(i);
++	m_sessions[i] = sess;
++	sess->lastPing = 1;
++	sess->lastPingTime = (uint32)UNIXTIME;
+ }
+ 
++Session * ClientMgr::CreateSession(uint32 AccountId)
++{
++	Session* sess = new Session(0xFFFFFFFF);
++	m_SessInsertQueue.Push(sess);
++	return sess;
++}
++
+ void ClientMgr::Update()
+ {
++	Session* insSess;
++	while((insSess = m_SessInsertQueue.Pop()))
++		InsertSession(insSess);
++	if (bCharCreate)
++		return;
+ 	for(uint32 i = 1; i <= m_maxSessionId; ++i)
+-		if(m_sessions[i])
+-			m_sessions[i]->Update();
++	{
++		if (bCharCreate)
++			return;
++		if(m_sessions[i])			
++			if (m_sessions[i]->IsDeleted())
++			{
++				Log.Debug("ClientMgr", "Removing session id %u account %u", i, m_sessions[i]->GetAccountId());
++				if (m_sessions[i]->GetNextServer())
++					continue;
++				else if (m_sessions[i]->GetPlayer() && m_sessions[i]->GetServer())//megai2: залогигены на сервере, делаем логаут
++				{
++					m_sessions[i]->GetServer()->LogoutPlayer(i, LS_DISCONNECT);
++					m_sessions[i]->Update();
++				}
++				else {//megai2: удаляемся
++					delete m_sessions[i];
++					m_sessions[i] = NULL;
++				}
++			} else 
++				m_sessions[i]->Update();
++	}
+ }
+ 
+ RPlayerInfo * ClientMgr::CreateRPlayer(uint32 guid)
+@@ -116,6 +192,8 @@
+ 	RPlayerInfo * rp = new RPlayerInfo;
+ 	rp->Guid = guid;
+ 	m_clients[guid] = rp;
++	if (m_clients.size() > peakOnline)
++		peakOnline = m_clients.size();
+ 	return rp;
+ }
+ 
+@@ -126,7 +204,13 @@
+ 	if(itr != m_clients.end())
+ 	{
+ 		rp = itr->second;
++
++		/* tell all other servers this player has gone offline */
++		WorldPacket data(ISMSG_DESTROY_PLAYER_INFO, 4);
++		data << rp->Guid << rp->Sessid;
++		sClusterMgr.DistributePacketToAll(&data);
++
+ 		m_clients.erase(itr);
+ 		delete rp;
+ 	}
+-}
++}
+\ No newline at end of file
+Index: WorkerServerSocket.h
+===================================================================
+--- WorkerServerSocket.h	(revision 824)
++++ WorkerServerSocket.h	(working copy)
+@@ -38,6 +38,7 @@
+ 	void HandleAuthRequest(WorldPacket & pck);
+ 	void HandleRegisterWorker(WorldPacket & pck);
+ 	void OnConnect();
++	void OnDisconnect();
+ 
+ };
+ 
+Index: RStdAfx.h
+===================================================================
+--- RStdAfx.h	(revision 824)
++++ RStdAfx.h	(working copy)
+@@ -18,7 +18,6 @@
+  */
+ 
+ #pragma once
+-
+ #include <list>
+ #include <vector>
+ #include <map>
+@@ -51,14 +50,21 @@
+ #include "../arcemu-shared/Auth/Sha1.h"
+ #include "../arcemu-shared/Auth/WowCrypt.h"
+ #include "../arcemu-shared/CrashHandler.h"
++#include "../arcemu-shared/FastQueue.h"
++#include "../arcemu-shared/CircularQueue.h"
++#include "../arcemu-shared/Threading/RWLock.h"
++#include "../arcemu-shared/Threading/Condition.h"
++#include "../arcemu-shared/arcemu_getopt.h"
++#include "../arcemu-shared/AuthCodes.h"
+ 
+ #include "../arcemu-world/Opcodes.h"
+ #include "../arcemu-shared/CallBack.h"
++#include "../arcemu-world/Definitions.h"
+ 
++#include "Structures.h"
+ #include "Master.h"
+ #include "WorkerOpcodes.h"
+ #include "WorkerServerSocket.h"
+-#include "Structures.h"
+ #include "WorldSocket.h"
+ #include "Session.h"
+ #include "WorkerServer.h"
+@@ -69,3 +75,4 @@
+ #include "../arcemu-shared/Storage.h"
+ #include "ObjectStorage.h"
+ #include "../arcemu-shared/CrashHandler.h"
++#include "AddonMgr.h"
+\ No newline at end of file
+Index: ClusterManager.h
+===================================================================
+--- ClusterManager.h	(revision 824)
++++ ClusterManager.h	(working copy)
+@@ -25,11 +25,9 @@
+ 	uint32 InstanceId;
+ 	uint32 MapId;
+ 	WServer * Server;
++	bool loading;
+ };
+ 
+-#define IS_INSTANCE(a) (((a)>1)&&((a)!=530))
+-#define IS_MAIN_MAP(a) (((a)<2)||((a)==530))
+-
+ class ClusterMgr : public Singleton<ClusterMgr>
+ {
+ 	typedef map<uint32, Instance*> InstanceMap;
+@@ -41,27 +39,35 @@
+ 	uint32 m_maxInstanceId;
+ 	uint32 m_maxWorkerServer;
+ 
++	FastQueue<WServer*, Mutex> m_wsInsertQueue;
++
+ public:
+ 	ClusterMgr();
+ 
++	ARCEMU_INLINE uint32 GetServersCount() { return m_maxWorkerServer; }
++
++	void DeleteWorkerServer(uint32 Idx);
++
+ 	WServer * GetServerByInstanceId(uint32 InstanceId);
+ 	WServer * GetServerByMapId(uint32 MapId);
+ 
+ 	Instance * GetInstanceByInstanceId(uint32 InstanceId);
+ 	Instance * GetInstanceByMapId(uint32 MapId);
+ 
++	void InsertWorkerServer(WServer * s);
+ 	WServer * CreateWorkerServer(WSSocket * s);
+ 	ARCEMU_INLINE WServer * GetWorkerServer(uint32 Id) { return (Id < MAX_WORKER_SERVERS) ? WorkerServers[Id] : 0; }
+-	void AllocateInitialInstances(WServer * server, vector<uint32>& preferred);
++	void AllocateInitialInstances(WServer * server, vector<WorldInstanceInfo>& preferred);
+ 
+ 	// find the worker server with the least load for the new instance
+ 	WServer * GetWorkerServerForNewInstance();
+ 
+ 	/* create new instance, or a main map */
+-	Instance * CreateInstance(uint32 MapId, WServer * server);
++	Instance * CreateInstance(uint32 MapId, WServer* server);
+ 
+ 	/* create new instance based on template, or a saved instance */
+-	Instance * CreateInstance(uint32 InstanceId, uint32 MapId);
++	Instance * CreateInstance(uint32 InstanceId, uint32 MapId, bool heroic=false);
++	Instance * AppendInstance(uint32 InstanceId, uint32 MapId, WServer* ws);
+ 
+ 	/* gets the instance struct by instance id */
+ 	Instance * GetInstance(uint32 InstanceId)
+@@ -72,9 +78,11 @@
+ 
+ 	/* distribute packet to all worker servers */
+ 	ARCEMU_INLINE void DistributePacketToAll(WorldPacket * data) { DistributePacketToAll(data, 0); }
++	ARCEMU_INLINE void DistributeWOWPacketToAll(Session* from, WorldPacket * data) { DistributeWOWPacketToAll(from, data, 0); }
+ 
+ 	/* distribute packet to all worker server excluding one */
+ 	void DistributePacketToAll(WorldPacket * data, WServer * exclude);
++	void DistributeWOWPacketToAll(Session* from, WorldPacket * data, WServer * exclude);
+ 
+ 	/* loop */
+ 	void Update();
+Index: Structures.h
+===================================================================
+--- Structures.h	(revision 824)
++++ Structures.h	(working copy)
+@@ -17,6 +17,281 @@
+  *
+  */
+ 
++#define STAT_SYS
++#define GLOBAL_MAX_GUID 0xFFFFFFFF
++
++#define IS_INSTANCE(a) (((a)>1)&&((a)!=530)&&((a)!=571)&&((a)!=449)&&((a)!=450))
++#define IS_MAIN_MAP(a) (((a)<2)||((a)==530)||((a)==571)||((a)==449)||((a)==450))
++#define MAPID_LIST_MAIN_MAP "0, 1, 530, 571, 449, 450"
++#define IS_BG_MAP(a) (((a)==449)||((a)==450)||((a)==489)||((a)==529)||((a)==30)||((a)==566)||((a)==559)||((a)==562)||((a)==607)||((a)==617)||((a)==572))
++//megai2: нужно нет? 618
++
++#ifndef _GAME
++
++enum INSTANCE_TYPE
++{
++	INSTANCE_NULL,
++	INSTANCE_RAID,
++	INSTANCE_NONRAID,
++	INSTANCE_PVP,
++	INSTANCE_MULTIMODE,
++};
++
++enum Races
++{
++	RACE_HUMAN = 1,
++	RACE_ORC = 2,
++	RACE_DWARF = 3,
++	RACE_NIGHTELF = 4,
++	RACE_UNDEAD = 5,
++	RACE_TAUREN = 6,
++	RACE_GNOME = 7,
++	RACE_TROLL = 8,
++	RACE_BLOODELF = 10,
++	RACE_DRAENEI = 11,
++};
++
++enum Classes
++{
++	WARRIOR = 1,
++	PALADIN = 2,
++	HUNTER = 3,
++	ROGUE = 4,
++	PRIEST = 5,
++	DEATHKNIGHT = 6,
++	SHAMAN = 7,
++	MAGE = 8,
++	WARLOCK = 9,
++	DRUID = 11,
++};
++
++struct ServerConf
++{
++	bool interfaction_chat;	
++	bool interfaction_group;
++};
++
++#define MAX_ACTIVE_WS 6
++
++struct GuidInfo
++{
++    union
++    {
++	    uint32 m_hiItemGuid[MAX_ACTIVE_WS];
++	    uint32 m_hiContainerGuid[MAX_ACTIVE_WS];
++    };
++	uint32 m_hiPlayerGuid[MAX_ACTIVE_WS];
++	uint32 m_hiGroupGuid;
++	uint32 m_hiGuildGuid[MAX_ACTIVE_WS];
++	uint32 m_mailGuid[MAX_ACTIVE_WS];
++	uint32 m_auctionGuid[MAX_ACTIVE_WS];
++
++	uint8 globalOffset;
++	uint8 realmsCnt;
++};
++
++enum ChatMsg
++{
++	CHAT_MSG_ADDON									= -1,
++	CHAT_MSG_SYSTEM                                 = 0,    //28,   CHAT_MSG_SYSTEM                 = 0x00,         0
++	CHAT_MSG_SAY									= 1,
++	CHAT_MSG_PARTY									= 2,
++	CHAT_MSG_RAID									= 3,
++	CHAT_MSG_GUILD									= 4,
++	CHAT_MSG_OFFICER								= 5,
++	CHAT_MSG_YELL									= 6,
++	CHAT_MSG_WHISPER								= 7,
++	CHAT_MSG_WHISPER_MOB							= 8,//CHAT_MSG_WHISPER_INFORM
++	CHAT_MSG_WHISPER_INFORM							= 9,//CHAT_MSG_REPLY
++	CHAT_MSG_EMOTE									= 10,
++	CHAT_MSG_TEXT_EMOTE								= 11,
++	CHAT_MSG_MONSTER_SAY							= 12,
++	CHAT_MSG_MONSTER_PARTY							= 13,
++	CHAT_MSG_MONSTER_YELL							= 14,
++	CHAT_MSG_MONSTER_WHISPER						= 15,
++	CHAT_MSG_MONSTER_EMOTE							= 16,
++	CHAT_MSG_CHANNEL								= 17,
++	CHAT_MSG_CHANNEL_JOIN							= 18,
++	CHAT_MSG_CHANNEL_LEAVE							= 19,
++	CHAT_MSG_CHANNEL_LIST							= 20,
++	CHAT_MSG_CHANNEL_NOTICE							= 21,
++	CHAT_MSG_CHANNEL_NOTICE_USER					= 22,
++	CHAT_MSG_AFK									= 23,
++	CHAT_MSG_DND									= 24,
++	CHAT_MSG_IGNORED								= 25,
++	CHAT_MSG_SKILL									= 26,
++	CHAT_MSG_LOOT									= 27,
++    CHAT_MSG_MONEY                                  = 28,
++    CHAT_MSG_OPENING                                = 29,
++    CHAT_MSG_TRADESKILLS                            = 30,
++    CHAT_MSG_PET_INFO                               = 31,
++    CHAT_MSG_COMBAT_MISC_INFO                       = 32,
++    CHAT_MSG_COMBAT_XP_GAIN                         = 33,
++    CHAT_MSG_COMBAT_HONOR_GAIN                      = 34,
++    CHAT_MSG_COMBAT_FACTION_CHANGE                  = 35,
++	CHAT_MSG_BG_EVENT_NEUTRAL						= 36,
++	CHAT_MSG_BG_EVENT_ALLIANCE						= 37,
++	CHAT_MSG_BG_EVENT_HORDE							= 38,
++	CHAT_MSG_RAID_LEADER							= 39,
++	CHAT_MSG_RAID_WARNING							= 40,
++	CHAT_MSG_RAID_WARNING_WIDESCREEN				= 41,
++    CHAT_MSG_RAID_BOSS_EMOTE                        = 42,
++	CHAT_MSG_FILTERED								= 43,
++	CHAT_MSG_BATTLEGROUND							= 44,
++	CHAT_MSG_BATTLEGROUND_LEADER					= 45,
++	CHAT_MSG_RESTRICTED								= 46,
++	CHAT_MSG_ACHIEVEMENT							= 47,
++    CHAT_MSG_GUILD_ACHIEVEMENT						= 48,
++};
++
++enum Languages
++{
++    LANG_UNIVERSAL                              = 0x00,
++    LANG_ORCISH                                 = 0x01,
++    LANG_DARNASSIAN                             = 0x02,
++    LANG_TAURAHE                                = 0x03,
++    LANG_DWARVISH                               = 0x06,
++    LANG_COMMON                                 = 0x07,
++    LANG_DEMONIC                                = 0x08,
++    LANG_TITAN                                  = 0x09,
++    LANG_THELASSIAN                             = 0x0A,
++    LANG_DRACONIC                               = 0x0B,
++    LANG_KALIMAG                                = 0x0C,
++    LANG_GNOMISH                                = 0x0D,
++    LANG_TROLL                                  = 0x0E,
++    LANG_GUTTERSPEAK                            = 0x21,
++    LANG_DRAENEI                                = 0x23,
++    NUM_LANGUAGES                               = 0x24
++};
++
++enum PartyErrors
++{
++	ERR_PARTY_NO_ERROR					= 0,
++	ERR_PARTY_CANNOT_FIND				= 1,
++	ERR_PARTY_IS_NOT_IN_YOUR_PARTY		= 2,
++	ERR_PARTY_UNK						= 3,
++	ERR_PARTY_IS_FULL					= 4,
++	ERR_PARTY_ALREADY_IN_GROUP			= 5,
++	ERR_PARTY_YOU_ARENT_IN_A_PARTY		= 6,
++	ERR_PARTY_YOU_ARE_NOT_LEADER		= 7,
++	ERR_PARTY_WRONG_FACTION				= 8,
++	ERR_PARTY_IS_IGNORING_YOU			= 9,
++};
++
++enum GroupTypes
++{
++	GROUP_TYPE_PARTY					= 0,
++	GROUP_TYPE_RAID						= 1,
++};
++
++#define PARTY_LOOT_FFA	  0
++#define PARTY_LOOT_MASTER   2
++#define PARTY_LOOT_RR	   1
++#define PARTY_LOOT_NBG	  4
++#define PARTY_LOOT_GROUP	3
++
++enum PartyUpdateFlags
++{
++	GROUP_UPDATE_FLAG_NONE						= 0,		// 0x00000000
++	GROUP_UPDATE_FLAG_ONLINE					= 1,		// 0x00000001  uint8
++	GROUP_UPDATE_FLAG_HEALTH					= 2,		// 0x00000002  uint16
++	GROUP_UPDATE_FLAG_MAXHEALTH					= 4,		// 0x00000004  uint16
++	GROUP_UPDATE_FLAG_POWER_TYPE				= 8,		// 0x00000008  uint16
++	GROUP_UPDATE_FLAG_POWER						= 16,		// 0x00000010  uint16
++	GROUP_UPDATE_FLAG_MAXPOWER					= 32,		// 0x00000020  uint16
++	GROUP_UPDATE_FLAG_LEVEL						= 64,		// 0x00000040  uint16
++	GROUP_UPDATE_FLAG_ZONEID					= 128,		// 0x00000080  uint16
++	GROUP_UPDATE_FLAG_POSITION					= 256,		// 0x00000100  uint16, uint16
++	GROUP_UPDATE_FLAG_PLAYER_AURAS				= 512,		// 0x00000200  uint64, uint16 for each uint64
++	GROUP_UPDATE_FLAG_PET_GUID					= 1024,		// 0x00000400  uint64
++	GROUP_UPDATE_FLAG_PET_NAME					= 2048,		// 0x00000800  string
++	GROUP_UPDATE_FLAG_PET_DISPLAYID				= 4096,		// 0x00001000  uint16
++	GROUP_UPDATE_FLAG_PET_HEALTH				= 8192,		// 0x00002000  uint16
++	GROUP_UPDATE_FLAG_PET_MAXHEALTH				= 16384,	// 0x00004000  uint16
++	GROUP_UPDATE_FLAG_PET_POWER_TYPE			= 32768,	// 0x00008000  uint8
++	GROUP_UPDATE_FLAG_PET_POWER					= 65535,	// 0x00010000  uint16
++	GROUP_UPDATE_FLAG_PET_MAXPOWER				= 131070,	// 0x00020000  uint16
++	GROUP_UPDATE_FLAG_PET_AURAS					= 262144,	// 0x00040000  uint64, uint16 for each uint64
++};
++
++enum PartyUpdateFlagGroups
++{
++	GROUP_UPDATE_TYPE_FULL_CREATE				=	GROUP_UPDATE_FLAG_ONLINE | GROUP_UPDATE_FLAG_HEALTH | GROUP_UPDATE_FLAG_MAXHEALTH |
++													GROUP_UPDATE_FLAG_POWER | GROUP_UPDATE_FLAG_LEVEL |
++													GROUP_UPDATE_FLAG_ZONEID | GROUP_UPDATE_FLAG_MAXPOWER | GROUP_UPDATE_FLAG_POSITION,
++	GROUP_UPDATE_TYPE_FULL_REQUEST_REPLY		=   0x7FFC0BFF,
++};
++
++struct Group {	
++	uint32 groupId;
++	uint8 groupType;
++	uint8 subCnt;
++	uint8 lootMeth;
++	uint8 lootThres;
++	uint32 difficulty;
++	uint32 leader;
++	uint32 mTank;
++	uint32 mAssist;
++	uint32 members[8][5];
++	uint32 timestamp;
++	uint32 instanceIds[NUM_MAPS][NUM_INSTANCE_MODES];
++	uint32 looter;
++	uint32 targetIcons[8];
++
++	bool IsFull() {
++		for(int32 i = 0; i < 1 + 7 * groupType; ++i)
++			for(uint32 j = 0; j < 5; ++j)
++			{
++				if (members[i][j] == 0)
++					return false;
++			}		
++		return true;
++	}
++
++	bool AddMember(uint32 guid) {
++		if (IsFull())
++			return false;
++
++		for(int32 i = 0; i < 1 + 7 * groupType; ++i)
++			for(uint32 j = 0; j < 5; ++j)
++			{
++				if (members[i][j] == 0)
++				{
++					if (i > subCnt)
++						subCnt = i;
++					members[i][j] = guid;
++					return true; 
++				}
++			}		
++		return false;
++	}
++	bool RemoveMember(uint32 guid) {
++		for(int32 i = 0; i < 1 + 7 * groupType; ++i)
++			for(uint32 j = 0; j < 5; ++j)
++			{
++				if (members[i][j] == guid)
++				{
++					members[i][j] = 0;
++					if (guid = leader)
++						for(int32 k = 0; k < 1 + 7 * groupType; ++k)
++							for(uint32 l = 0; l < 5; ++l)						
++								if (members[k][l])
++								{
++									leader = members[k][l]; 
++									return true;
++								}
++					return true; 
++				}
++			}		
++		return false;
++	}
++};
++
++#endif
++
++#define PUT_SELF_TO_OTHER 0
++#define PUT_OTHER_TO_SELF 1
++
+ struct RPlayerInfo
+ {
+ 	uint32 Guid;
+@@ -26,35 +301,116 @@
+ 	uint32 GuildId;
+ 	float PositionX;
+ 	float PositionY;
++	float PositionZ;
+ 	uint32 ZoneId;
+ 	uint8 Race;
++	uint8 Team;
+ 	uint8 Class;
++	CharClassEntry * DBCClass;
+ 	uint8 Gender;
+ 	uint32 Latency;
+ 	string GMPermissions;
+ 	uint32 Account_Flags;
+ 	uint32 InstanceId;
+ 	uint32 MapId;
++	uint32 Sessid;
++	bool bGMTag;
++	uint32 LootInfo;//megai2: hiword - thres loword - type
++	uint32 GuildPrem;
++	uint32 GroupID;
+ 
++	uint32 inviter;
++	uint32 guildinviter; //ыштсу guilds rest on worldservers =/
++
++#ifndef _GAME
++	/* This stuff is used only by the realm server */
++	Group * m_Group;
++	uint32 RecoveryMapId;
++	LocationVector RecoveryPosition;
++	bool onBg;
++#else
++	uint8 loot_thres;
++	uint8 loot_method;
++	bool bGroup;
++#endif
++
+ 	void Pack(ByteBuffer& buf)
+ 	{
+-		buf << Guid << AccountId << Name << PositionX << PositionY << ZoneId << Race << Class << Gender << Latency << GMPermissions
+-			<< Account_Flags << InstanceId << Level << GuildId << MapId;
++		buf << Guid << AccountId << Name << PositionX << PositionY << PositionZ << ZoneId << Race << Team << Class << Gender << Latency << GMPermissions
++			<< Account_Flags << InstanceId << Level << GuildId << MapId << Sessid << bGMTag << guildinviter << GuildPrem << LootInfo;
++#ifndef _GAME
++		if (m_Group)
++			buf << m_Group->groupId;
++		else
++			buf << uint32(0);
++#else
++		buf << GroupID;
++#endif
+ 	}
+ 
+ 	void Unpack(ByteBuffer & buf)
+ 	{
+-		buf >> Guid >> AccountId >> Name >> PositionX >> PositionY >> ZoneId >> Race >> Class >> Gender >> Latency >> GMPermissions
+-			>> Account_Flags >> InstanceId << Level << GuildId << MapId;
++		buf >> Guid >> AccountId >> Name >> PositionX >> PositionY >> PositionZ >> ZoneId >> Race >> Team >> Class >> Gender >> Latency >> GMPermissions
++			>> Account_Flags >> InstanceId >> Level >> GuildId >> MapId >> Sessid >> bGMTag >> guildinviter >> GuildPrem >> LootInfo >> GroupID;
+ 	}
+ 
+-#ifndef _GAME
+-	/* This stuff is used only by the realm server */
+-	uint32 RecoveryMapId;
+-	LocationVector RecoveryPosition;
+-#endif
++	bool hasGMCommand(char comm)
++	{
++		// checking properties
++		if(GMPermissions == "")
++			return false;
++		if(comm == 0)
++			return false;
++		
++		// getting commandlist
++		for(uint32 i = 0; i < GMPermissions.length(); ++i)
++		{
++			char c = GMPermissions.at(i);
++			c = tolower(c);
++			//sLog.outDebug("c=%c %i, comm=%c %i", c, c, comm, comm);
++
++			if(c == 'a')
++				return true;
++			else 
++				if(c == comm)
++					return true;
++		}
++		return false;
++	}
++	
++	uint32 GetTeam(){ return Team; };
+ };
+ 
++enum WorkerTypes 
++{
++	WS_WORLD = 0
++};
++
++struct authReply
++{
++	WorkerTypes WorkerType;
++};
++
++struct WorldInstanceInfo
++{
++	uint32 MapId;
++	uint32 InstanceId;
++};
++
++#define	UI_LEVEL		1
++#define	UI_GUILD		2
++#define	UI_ZONE			3
++#define	UI_GMTAG		4
++#define	UI_GUILDR		5
++#define UI_GINVITER		6
++
++#define GT_ITEM			1
++#define GT_PLAYER		2
++#define GT_CONTAINER	3
++#define GT_GUILD		4
++#define GT_MAIL			5
++#define GT_AUCTION      6
++
+ #ifndef _GAME
+ /* Copied structures from game */
+ struct SocketInfo {
+@@ -155,7 +511,7 @@
+ 	int32 DisenchantReqSkill;
+ 	uint32 ArmorDamageModifier;
+ 	uint32 ExistingDuration;
+-	uint32 ItemLimitCategory;
++	uint32 ItemLimitCategory;	
+ 
+ 	string lowercase_name;	// used in auctions
+ 	uint32 FoodType;		//pet food type
+@@ -206,6 +562,7 @@
+ 	}
+ };
+ 
++
+ struct GameObjectInfo
+ {
+ 	uint32 ID;
+@@ -270,7 +627,7 @@
+ 
+ 	uint32 time;
+ 	uint32 special_flags;
+-	
++
+ 	uint32 previous_quest_id;
+ 	uint32 next_quest_id;
+ 
+@@ -307,7 +664,7 @@
+ 	uint32 reward_xp;
+ 	uint32 reward_spell;
+ 	uint32 effect_on_player;
+-	
++
+ 	uint32 point_mapid;
+ 	uint32 point_x;
+ 	uint32 point_y;
+@@ -321,12 +678,13 @@
+ 	uint32 receive_items[4];
+ 	uint32 receive_itemcount[4];
+ 	int is_repeatable;
++
+ 	//
+ 	uint32 bonushonor;
+ 	uint32 rewardtitleid;
+ 	uint32 rewardtalents;
+ 	uint32 suggestedplayers;
+-
++ 
+ 	/* emotes */
+ 	uint32 detailemotecount;
+ 	uint32 detailemote[4];
+@@ -339,6 +697,7 @@
+ 
+ 	/* this marks the end of the fields loaded from db - don't remove the comment please */
+ 
++
+ 	uint32 count_required_mob;
+ 	uint32 count_requiredquests;
+ 	uint32 count_requiredtriggers;
+@@ -380,7 +739,7 @@
+ 	char * name;
+ 	uint32 flags;
+ 	uint32 cooldown;
+-    uint32 lvl_mod_a;
++	uint32 lvl_mod_a;
+ 	uint32 required_quest;
+ 	uint32 required_item;
+ 	uint32 heroic_key_1;
+@@ -394,20 +753,6 @@
+ 	}
+ };
+ 
+-enum Classes
+-{
+-	WARRIOR = 1,
+-	PALADIN = 2,
+-	HUNTER = 3,
+-	ROGUE = 4,
+-	PRIEST = 5,
+-	SHAMAN = 7,
+-	MAGE = 8,
+-	WARLOCK = 9,
+-	DRUID = 11,
+-	DEATH_KNIGHT = 12
+-};
+-
+ #define EQUIPMENT_SLOT_START		 0
+ #define EQUIPMENT_SLOT_HEAD		  0
+ #define EQUIPMENT_SLOT_NECK		  1
+Index: Session.h
+===================================================================
+--- Session.h	(revision 824)
++++ Session.h	(working copy)
+@@ -19,6 +19,8 @@
+ 
+ #ifndef _R_SESSION_H
+ #define _R_SESSION_H
++#define WORLDSOCKET_TIMEOUT		 120
++#define CHECK_PACKET_SIZE(pckp, ssize) if(ssize && pckp.size() < ssize) { SafeRemove(); return; }
+ 
+ typedef void(Session::*SessionPacketHandler)(WorldPacket&);
+ 
+@@ -29,11 +31,15 @@
+ 	Session(uint32 id);
+ 	~Session();
+ 
++	string m_lang;
++
+ protected:
+-	FastQueue<WorldPacket*, Mutex> m_readQueue;
++	FastQueue<WorldPacket*, Mutex> m_readQueue[2];
++	bool actQu;
+ 	WorldSocket * m_socket;
+ 	WServer * m_server;
+ 	WServer * m_nextServer;
++	WServer * m_oldServer;
+ 	uint32 m_sessionId;
+ 	uint32 m_accountId;
+ 	RPlayerInfo * m_currentPlayer;
+@@ -42,42 +48,122 @@
+ 	string m_GMPermissions;
+ 	string m_accountName;
+ 	uint32 m_build;
+-	uint32 latency;
++	uint32 m_muted;
++	uint8 _side;
++	bool has_55_lvl;
++	bool has_dk;
++	bool m_deleted;
++	WorldPacket* teleportRq;
++	uint32 pendingSID;
++	uint32 pendingIID;
+ 	static SessionPacketHandler Handlers[NUM_MSG_TYPES];
+ 
+ public:
++	uint32 latency;
++	uint32 lastPing;
++	uint32 lastPingTime;
++	void SystemMessage(const char * format, ...);
++
+ 	static void InitHandlers();
+ 	void Update();
+ 	ARCEMU_INLINE RPlayerInfo * GetPlayer() { return m_currentPlayer; }
+ 
+ 	ARCEMU_INLINE void ClearCurrentPlayer() { m_currentPlayer = 0; }
+ 	ARCEMU_INLINE void ClearServers() { m_nextServer = m_server = 0; }
+-	ARCEMU_INLINE void SetNextServer() { m_server = m_nextServer; }
+-	ARCEMU_INLINE void SetServer(WServer * s) { m_server = s; }
++	ARCEMU_INLINE void SetOldServer(WServer * s) { m_oldServer = s; }
++	ARCEMU_INLINE void SetNextServerValue(WServer * s) { m_nextServer = s; }
++	ARCEMU_INLINE void SetNextServer() { 
++			m_oldServer = m_server;
++			m_server = m_nextServer; 
++			m_nextServer = NULL;
++		}
++	ARCEMU_INLINE void SetServer(WServer * s) { m_oldServer = m_server; m_server = s; }
++	ARCEMU_INLINE WServer * GetOldServer() { return m_oldServer; }
+ 	ARCEMU_INLINE WServer * GetServer() { return m_server; }
++	ARCEMU_INLINE WServer * GetNextServer() { return m_nextServer; }
+ 	ARCEMU_INLINE WorldSocket * GetSocket() { return m_socket; }
+-	ARCEMU_INLINE void SetSocket(WorldSocket * val) { m_socket = val; }
++	ARCEMU_INLINE void SetSocket(WorldSocket* val) { m_socket = val; }
+ 	ARCEMU_INLINE uint32 GetAccountId() { return m_accountId; }
++	string GetGMPremissions() { return m_GMPermissions; }
++	string GetAccountName() { return m_accountName; }
++	ARCEMU_INLINE uint32 GetAccountFlags() { return m_accountFlags; }
+ 	ARCEMU_INLINE uint32 GetSessionId() { return m_sessionId; }
++	ARCEMU_INLINE void SetSessionID(uint32 val) { m_sessionId = val; }
++	ARCEMU_INLINE void SetDeleted() { m_deleted = true; }
++	ARCEMU_INLINE bool IsDeleted() { return m_deleted; }
++	ARCEMU_INLINE void SetTeleportPending(WorldPacket* pck, uint32 sid, uint32 IID) { 
++		teleportRq = pck; 
++		if (teleportRq)
++			teleportRq->rpos(0);
++		pendingSID = sid; 
++		pendingIID = IID;
++	}
++	ARCEMU_INLINE WorldPacket* GetTeleportPendingPck() { return teleportRq; }
++	ARCEMU_INLINE uint32 GetTeleportPendingSID() { return pendingSID; }
++	ARCEMU_INLINE uint32 GetTeleportPendingIID() { return pendingIID; }
++	void GroupUpdate();
+ 
++	void SafeRemove()
++	{
++		if(m_socket && m_socket->IsConnected())
++		{
++			m_socket->Disconnect();
++			if (m_sessionId == 0xFFFFFFFF)
++				delete this;
++		}
++		else 
++			delete this;
++	}
++
+ 	void SendPacket(WorldPacket * data)
+ 	{
+ 		if(m_socket && m_socket->IsConnected())
+ 			m_socket->SendPacket(data);
+ 	}
+ 
+-	void HandlePing(WorldPacket & pck);
++	void OutPacket(uint16 opcode, uint16 len, const void* data)
++	{
++		if(m_socket && m_socket->IsConnected())
++			m_socket->OutPacket(opcode, len, data);
++	}
++
++	ARCEMU_INLINE bool HasGMPermissions() { return (bool)(m_GMPermissions.length() > 0); } 
++
++	void SendPartyCommandResult(RPlayerInfo* pPlayer, uint32 p1, std::string name, uint32 err);
++
+ 	void HandlePlayerLogin(WorldPacket & pck);
+ 	void HandleCharacterEnum(WorldPacket & pck);
+ 	void HandleCharacterCreate(WorldPacket & pck);
+ 	void HandleCharacterDelete(WorldPacket & pck);
+ 	void HandleCharacterRename(WorldPacket & pck);
+-	
++	void HandlePing(WorldPacket & pck);
+ 	void HandleItemQuerySingleOpcode(WorldPacket & pck);
+ 	void HandleCreatureQueryOpcode(WorldPacket & pck);
+ 	void HandleGameObjectQueryOpcode(WorldPacket & pck);
+ 	void HandleItemPageQueryOpcode(WorldPacket & pck);
+ 	void HandleNpcTextQueryOpcode(WorldPacket & pck);
++	void HandleChatMessage(WorldPacket & recv_data);
++	void HandleWhoOpcode(WorldPacket & pck);
++	void HandleGroupInviteOpcode(WorldPacket & pck);
++	void HandleGroupCancelOpcode(WorldPacket & pck);
++	void HandleGroupAcceptOpcode(WorldPacket & pck);
++	void HandleGroupDeclineOpcode(WorldPacket & pck);
++	void HandleGroupUninviteOpcode(WorldPacket & pck);
++	void HandleGroupUninviteGuildOpcode(WorldPacket & pck);
++	void HandleGroupSetLeaderOpcode(WorldPacket & pck);
++	void HandleGroupDisbandOpcode(WorldPacket & pck);
++	void HandleLootMethodOpcode(WorldPacket & pck);
++	void HandleMinimapPingOpcode(WorldPacket & pck);
++	void HandleConvertGroupToRaidOpcode(WorldPacket & pck);
++	void HandleGroupChangeSubGroup(WorldPacket & pck);
++	void HandleGroupAssistantLeader(WorldPacket & pck);
++	void HandleRequestRaidInfoOpcode(WorldPacket & pck);
++	void HandleReadyCheckOpcode(WorldPacket & pck);
++	void HandleSetPlayerIconOpcode(WorldPacket & pck);
++	void HandlePartyMemberStatsOpcode(WorldPacket & pck);
++	void HandleGroupPromote(WorldPacket & pck);
++	void HandleDungeonDifficultyOpcode(WorldPacket& pck);
++	void HandleBgOps(WorldPacket &recv_data);
+ };
+ 
+ #endif
+Index: LogonCommHandler.cpp
+===================================================================
+--- LogonCommHandler.cpp	(revision 824)
++++ LogonCommHandler.cpp	(working copy)
+@@ -20,7 +20,7 @@
+ 
+ #include "RStdAfx.h"
+ initialiseSingleton(LogonCommHandler);
+-#ifndef CLUSTERING
++//#ifndef CLUSTERING
+ LogonCommHandler::LogonCommHandler()
+ {
+ 	idhigh = 1;
+@@ -169,6 +169,8 @@
+ 
+ void LogonCommHandler::Connect(LogonServer * server)
+ {
++/*	if(sMaster.m_ShutdownEvent == true && sMaster.m_ShutdownTimer <= 120000) // 2minutes
++		return;*/
+ 
+ 	server->RetryTime = (uint32)UNIXTIME + 10;
+ 	server->Registered = false;
+@@ -180,11 +182,11 @@
+ 		return;
+ 	}
+ 	Log.Notice("LogonCommClient", "Authenticating...");
+-	uint32 tt = (uint32)GetTickCount() + 2000;
++	uint32 tt = (uint32)UNIXTIME + 10;
+ 	conn->SendChallenge();
+ 	while(!conn->authenticated)
+ 	{
+-		if((uint32)GetTickCount() >= tt)
++		if((uint32)UNIXTIME >= tt)
+ 		{
+ 			Log.Notice("LogonCommClient", "Authentication timed out.");
+ 			conn->Disconnect();
+@@ -192,8 +194,7 @@
+ 			return;
+ 		}
+ 
+-		//megai2: иначе обработка сокета уйдет вжопу
+-		WaitForSingleObject(GetCurrentThread(), 400);
++		Sleep(50);
+ 	}
+ 
+ 	if(conn->authenticated != 1)
+@@ -547,4 +548,4 @@
+ 	// Calc pop: 0 >= low, 1 >= med, 2 >= hig, 3 >= full
+ 	server_population = float(((sClientMgr.GetPlayersCount()) * 3) / pLimit);
+ }
+-#endif
++//#endif
+Index: LogonCommClient.cpp
+===================================================================
+--- LogonCommClient.cpp	(revision 824)
++++ LogonCommClient.cpp	(working copy)
+@@ -27,7 +27,8 @@
+ }logonpacket;
+ #pragma pack(pop)
+ 
+-#ifndef CLUSTERING
++//#ifndef CLUSTERING
++#ifndef TEST_NO_DEF
+ 
+ #ifndef USING_BIG_ENDIAN
+ ARCEMU_INLINE static void swap32(uint32* p) { *p = ((*p >> 24 & 0xff)) | ((*p >> 8) & 0xff00) | ((*p << 8) & 0xff0000) | (*p << 24); }
+@@ -138,6 +139,10 @@
+ 	string realmname;
+ 	recvData >> error >> realmlid >> realmname;
+ 
++#ifdef STAT_SYS
++	realmName = realmname;
++#endif
++
+ #ifdef WIN32
+ 	Log.Notice("LogonCommClient", "Realm `%s` (UNICODE) registered as realm %u.", _StringToANSI(realmname.c_str()), realmlid);
+ #else
+@@ -169,6 +174,7 @@
+ 	sLogonCommHandler.RemoveUnauthedSocket(request_id);
+ 	sock->InformationRetreiveCallback(recvData, request_id);
+ 	m.Release();
++
+ }
+ 
+ void LogonCommClientSocket::HandlePong(WorldPacket & recvData)
+@@ -405,20 +411,18 @@
+ 	uint32 id;
+ 	recvData >> id;
+ 
+-	Session * sess = sClientMgr.GetSession(id);
++	/*	WorldSession * sess = sWorld.FindSession(id);
+ 	if(sess != NULL)
+-		sess->GetSocket()->Disconnect();
++		sess->Disconnect();*/
+ }
+ 
+-//void ConsoleAuthCallback(uint32 request, uint32 result);
+ void LogonCommClientSocket::HandleConsoleAuthResult(WorldPacket & recvData)
+ {
+ 	uint32 requestid, result;
+ 	recvData >> requestid >> result;
+ 
+-	//ConsoleAuthCallback(requestid, result);
++	
+ }
+-
+ void LogonCommClientSocket::HandlePopulationRequest(WorldPacket & recvData)
+ {
+ 	uint32 realmId;
+Index: CharacterHandler.cpp
+===================================================================
+--- CharacterHandler.cpp	(revision 824)
++++ CharacterHandler.cpp	(working copy)
+@@ -18,12 +18,9 @@
+  */
+ 
+ #include "RStdAfx.h"
+-#include "../arcemu-shared/AuthCodes.h"
+ 
+ void Session::HandleCharacterEnum(WorldPacket & pck)
+ {
+-	uint32 start_time = getMSTime();
+-	QueryResult* result  = CharacterDatabase.Query("SELECT guid, level, race, class, gender, bytes, bytes2, name, positionX, positionY, positionZ, mapId, zoneId, banned, restState, deathstate, forced_rename_pending, player_flags, guild_data.guildid FROM characters LEFT JOIN guild_data ON characters.guid = guild_data.playerid WHERE acct=%u ORDER BY guid LIMIT 10", GetAccountId());
+ 	struct player_item
+ 	{
+ 		uint32 displayid;
+@@ -41,11 +38,20 @@
+ 	uint8 num = 0;
+ 	uint8 race;
+ 
++	uint32 start_time = getMSTime();
++
++	// loading characters
++	QueryResult* result = CharacterDatabase.Query("SELECT guid, level, race, class, gender, bytes, bytes2, name, positionX, positionY, positionZ, mapId, zoneId, banned, restState, deathstate, forced_rename_pending, player_flags, guild_data.guildid FROM characters LEFT JOIN guild_data ON characters.guid = guild_data.playerid WHERE acct=%u and guid > %u and guid < %u ORDER BY guid LIMIT 10", GetAccountId(), (GLOBAL_MAX_GUID / sGuidInfo.realmsCnt) * (sGuidInfo.globalOffset - 1), (GLOBAL_MAX_GUID / sGuidInfo.realmsCnt) * sGuidInfo.globalOffset);
++
+ 	// should be more than enough.. 200 bytes per char..
+-	WorldPacket data(SMSG_CHAR_ENUM, (result ? result->GetRowCount() * 200 : 1));	
++	WorldPacket data((result ? result->GetRowCount() * 200 : 1));	
+ 
+ 	// parse m_characters and build a mighty packet of
+ 	// characters to send to the client.
++	data.SetOpcode(SMSG_CHAR_ENUM);
++
++	// parse m_characters and build a mighty packet of
++	// characters to send to the client.
+ 	data << num;
+ 	if( result )
+ 	{
+@@ -64,6 +70,13 @@
+ 			flags = fields[17].GetUInt32();
+ 			race = fields[2].GetUInt8();
+ 
++			if( _side < 0 )
++			{
++				// work out the side
++				static uint8 sides[RACE_DRAENEI+1] = { 0, 0, 1, 0, 0, 1, 1, 0, 1, 0, 1, 0 };
++				_side = sides[race];
++			}
++
+ 			/* build character enum, w0000t :p */
+ 			data << guid;						// guid
+ 			data << fields[7].GetString();		// name
+@@ -80,8 +93,14 @@
+ 			data << fields[10].GetFloat();		// Z
+ 			data << fields[18].GetUInt32();		// GuildID
+ 
+-			//banned = fields[13].GetUInt32();
+-			banned = 1;
++			if (fields[1].GetUInt8() > 55)
++				has_55_lvl = true;
++
++			if (Class == DEATHKNIGHT)
++				has_dk = true;
++
++			banned = fields[13].GetUInt32();
++			//banned = 1;
+ 			if(banned && (banned<10 || banned > (uint32)UNIXTIME))
+ 				data << uint32(0x01A04040);
+ 			else
+@@ -93,9 +112,9 @@
+ 				else
+ 					data << uint32(1);		// alive
+ 			}
++
++			data << uint32(0); //Added in 3.0.2
+ 			
+-					data << uint32(0); //Added in 3.0.2
+-			
+ 			data << fields[14].GetUInt8();		// Rest State
+ 
+ 			if( Class == WARLOCK || Class == HUNTER )
+@@ -179,11 +198,98 @@
+ 	SendPacket( &data );
+ }
+ 
++void Session::HandleCharacterDelete(WorldPacket & pck)
++{
++	uint64 guid;
++	pck >> guid;
+ 
++	std::string name = sClientMgr.GetPlayerName((uint32)guid);
++
++	if (name == "name_not_found_xxx")
++	{
++		OutPacket(SMSG_CHAR_DELETE, 1, CHAR_DELETE_FAILED);
++		return;
++	}
++
++	CharacterDatabase.Query("UPDATE characters SET name = \"%s_deleted_%u_%u\", acct = 0 WHERE guid = %u AND acct = %u AND name = \"%s\"", name.c_str(), GetAccountId(), (uint32)guid, (uint32)guid, GetAccountId(), name.c_str());
++
++	OutPacket(SMSG_CHAR_DELETE, 1, CHAR_DELETE_SUCCESS);
++}
++
++void Session::HandleCharacterCreate( WorldPacket & recv_data )
++{
++	//megai2: слишком много проверок -> посылаем все к нужному миру
++	CHECK_PACKET_SIZE(recv_data, 10);
++	std::string name;
++	uint8 race, class_;
++	WServer * dstServ = NULL;
++
++	recv_data >> name >> race >> class_;
++	recv_data.rpos(0);
++
++	if (class_ == DEATHKNIGHT)
++	{
++		if (!has_55_lvl) 
++		{
++			OutPacket(SMSG_CHAR_CREATE, 1, CHAR_CREATE_ERROR_NEED_LVL_55_CHAR);
++			return;
++		}
++		if (has_dk)
++		{
++			OutPacket(SMSG_CHAR_CREATE, 1, CHAR_CREATE_ERROR_HERO_CLASS_LIMIT);
++			return;			
++		}
++	}
++	
++	if (class_ == DEATHKNIGHT)
++		dstServ = sClusterMgr.GetServerByMapId(0);
++	if (race == RACE_BLOODELF || race == RACE_DRAENEI)
++		dstServ = sClusterMgr.GetServerByMapId(530);
++	else if (race == RACE_DWARF || race == RACE_GNOME || race == RACE_HUMAN || race == RACE_UNDEAD)
++		dstServ = sClusterMgr.GetServerByMapId(0);
++	else if (race == RACE_NIGHTELF || race == RACE_ORC || race == RACE_TAUREN || race == RACE_TROLL)
++		dstServ = sClusterMgr.GetServerByMapId(1);
++
++	if(class_ == DEATHKNIGHT && !(GetAccountFlags() &  0x10))
++	{
++		//sCheatLog.writefromsession(m_session, "tried to create player with race %u and class %u but no expansion flags", race, class_);
++		if (m_socket)
++		{
++			OutPacket(SMSG_CHAR_CREATE, 1, CHAR_CREATE_EXPANSION_CLASS);
++		}
++		return;
++	}
++
++	// check that the account CAN create TBC characters, if we're making some
++	if(race >= RACE_BLOODELF && !(GetAccountFlags() & 0x8))
++	{
++		//sCheatLog.writefromsession(m_session, "tried to create player with race %u and class %u but no expansion flags", race, class_);
++		if (m_socket)
++		{
++			OutPacket(SMSG_CHAR_CREATE, 1, CHAR_CREATE_EXPANSION);
++		}
++		return;
++	}
++
++	if (!dstServ)
++	{
++		OutPacket(SMSG_CHAR_CREATE, 1, CHAR_CREATE_FAILED);
++		return;
++	}
++
++	WorldPacket * data = new WorldPacket(ISMSG_PLAYER_CREATE, 300);
++
++	*data << GetAccountId() << _side << GetGMPremissions();
++	data->append(recv_data.contents(), recv_data.size());
++
++	sClientMgr.bCharCreate = dstServ->GetID();
++	dstServ->SendPacket(data);
++	delete data;
++}
++
+ void Session::HandlePlayerLogin(WorldPacket & pck)
+ {
+-	WorldPacket data(SMSG_CHARACTER_LOGIN_FAILED, 30);
+-
++	WorldPacket data(SMSG_CHARACTER_LOGIN_FAILED, 300);
+ 	LocationVector LoginCoord;
+ 	Instance * dest;
+ 	ASSERT(!m_currentPlayer);
+@@ -197,31 +303,47 @@
+ 		return;
+ 	}
+ 
+-	m_currentPlayer = sClientMgr.CreateRPlayer((uint32)guid);
+-	RPlayerInfo * p = m_currentPlayer;
++	RPlayerInfo * p = sClientMgr.CreateRPlayer((uint32)guid);
++	m_currentPlayer = p;//megai2: ололо
++	p->m_Group = sClientMgr.GetGroupForGuid((uint32)guid);
++	p->Sessid = GetSessionId();
++	p->bGMTag = false;
++	p->inviter = 0;
++	p->guildinviter = 0;
++	p->LootInfo = -1;
++	p->onBg = false;
+ 
+ 	/* Load player data */
+-	QueryResult * result = CharacterDatabase.Query("SELECT acct, name, level, guildid, positionX, positionY, zoneId, mapId, race, class, gender, instance_id, entrypointmap, entrypointx, entrypointy, entrypointz, entrypointo FROM characters WHERE guid = %u", guid);
++    //этот запрос должен быть верным, его не тестил SELECT acct, name, level, positionX, positionY, zoneId, mapId, race, class, gender, instance_id, entrypointmap, entrypointx, entrypointy, entrypointz, entrypointo, guild_data.guildid FROM characters LEFT JOIN guild_data ON characters.guid = guild_data.playerid WHERE guid = %u
++	//нет, неверен. Не возвращает значения =/
++	QueryResult * result = CharacterDatabase.Query("SELECT acct, name, level, positionX, positionY, positionZ, zoneId, mapId, race, class, gender, instance_id, bindmapId, bindpositionX, bindpositionY, bindpositionZ, entrypointo, guild_data.guildid, guild_data.guildRank FROM characters LEFT JOIN guild_data ON characters.guid = guild_data.playerid WHERE guid = %u", guid);
+ 	if(result)
+ 	{
+ 		Field * f = result->Fetch();
+ 		p->AccountId = f[0].GetUInt32();
+ 		p->Name = f[1].GetString();
+ 		p->Level = f[2].GetUInt32();
+-		p->GuildId = f[3].GetUInt32();
+-		p->PositionX = f[4].GetFloat();
+-		p->PositionY = f[5].GetFloat();
++		p->GuildId = f[17].GetUInt32();
++		p->GuildPrem = f[18].GetUInt32();
++		p->PositionX = f[3].GetFloat();
++		p->PositionY = f[4].GetFloat();
++		p->PositionZ = f[5].GetFloat();
+ 		p->ZoneId = f[6].GetUInt32();
+ 		p->MapId = f[7].GetUInt32();
+ 		p->Race = f[8].GetUInt8();
+ 		p->Class = f[9].GetUInt8();
++		p->DBCClass = dbcCharClass.LookupEntry(p->Class);
+ 		p->Gender = f[10].GetUInt8();
+ 		p->Latency = m_latency;
+ 		p->GMPermissions = m_GMPermissions;
+ 		p->Account_Flags = m_accountFlags;
+ 		p->InstanceId = f[11].GetUInt32();
+-		p->RecoveryMapId = f[12].GetUInt32();
++		p->RecoveryMapId = f[12].GetUInt32();//инстой быть не должна. если будет инстой - добавить телепорт на бин позицию(bindpositionX 	bindpositionY 	bindpositionZ 	bindmapId 	bindzoneId)
+ 		p->RecoveryPosition.ChangeCoords(f[13].GetFloat(), f[14].GetFloat(), f[15].GetFloat(), f[16].GetFloat());
++		//										UNK		HUMAN	ORC		DWARF	NIGHTELF	UNDEAD	TAUREN	GNOME	TROLL	UNK		BLOODELF	DRAENEI
++		static uint8 sides[RACE_DRAENEI+1] = {	0,		0,		1,		0,		0,			1,		1,		0,		1,		0,		1,			0 };
++		p->Team = sides[p->Race];
++
+ 		delete result;
+ 	}
+ 	else
+@@ -233,10 +355,53 @@
+ 		return;
+ 	}
+ 
+-	if(IS_MAIN_MAP(m_currentPlayer->MapId))
++	//megai2: о_О?
++	if (!IS_MAIN_MAP(m_currentPlayer->RecoveryMapId))
+ 	{
++		m_currentPlayer->RecoveryMapId = 0;
++		m_currentPlayer->RecoveryPosition.ChangeCoords(0, 0, 50, 0);
++	}
++
++	if (sClientMgr.m_plNames.find(p->Guid) == sClientMgr.m_plNames.end())
++		sClientMgr.m_plNames.insert(make_pair(uint32(guid), p->Name));
++
++	//megai2: бг мапа без инсты - гет оут оф хере омфг
++	if (IS_BG_MAP(m_currentPlayer->MapId) && !sClusterMgr.GetInstanceByInstanceId(m_currentPlayer->InstanceId) && m_currentPlayer->MapId != 449 && m_currentPlayer->MapId != 450)
++	{
++		//megai2: RecoveryMapID - всегда континент
++		if (!IS_MAIN_MAP(m_currentPlayer->RecoveryMapId))
++			return;
++		m_currentPlayer->MapId = m_currentPlayer->RecoveryMapId;
++		LoginCoord = m_currentPlayer->RecoveryPosition;
++		m_currentPlayer->InstanceId = 0;
++
++		/* obtain instance */
++		dest = sClusterMgr.GetInstanceByMapId(m_currentPlayer->MapId);
++		if(dest)
++		{
++			data.SetOpcode(SMSG_NEW_WORLD);
++               data << m_currentPlayer->MapId << m_currentPlayer->RecoveryPosition << float(0);
++			SendPacket(&data);
++			data.clear();
++		} else {
++			data << uint8(CHAR_LOGIN_NO_WORLD);
++			SendPacket(&data);
++			sClientMgr.DestroyRPlayerInfo((uint32)guid);
++			ClearCurrentPlayer();
++			return;
++		}		
++	} else if(IS_MAIN_MAP(m_currentPlayer->MapId))
++	{
+ 		/* we're on a continent, try to find the world server we're going to */
+-		dest = sClusterMgr.GetInstanceByMapId(m_currentPlayer->MapId);		
++		dest = sClusterMgr.GetInstanceByMapId(m_currentPlayer->MapId);	
++		if (!dest)
++		{
++			SendPacket(&data);
++			sClientMgr.DestroyRPlayerInfo((uint32)guid);
++			ClearCurrentPlayer();
++			return;
++		}
++		dest->InstanceId = 0;
+ 	}
+ 	else
+ 	{
+@@ -245,9 +410,22 @@
+ 
+ 		if(!dest)
+ 		{
++			//megai2: если сервер вдруг тупо упал, а на самом деле инст существует.
++			if (!sClusterMgr.GetWorkerServerForNewInstance())
++			{
++				data << uint8(CHAR_LOGIN_NO_WORLD);
++				SendPacket(&data);
++				sClientMgr.DestroyRPlayerInfo((uint32)guid);
++				ClearCurrentPlayer();
++				return;
++			}
+ 			/* our instance has been deleted or no longer valid */
++			//megai2: RecoveryMapID - всегда континент
++			if (!IS_MAIN_MAP(m_currentPlayer->RecoveryMapId))
++				return;
+ 			m_currentPlayer->MapId = m_currentPlayer->RecoveryMapId;
+ 			LoginCoord = m_currentPlayer->RecoveryPosition;
++			m_currentPlayer->InstanceId = 0;
+ 
+ 			/* obtain instance */
+ 			dest = sClusterMgr.GetInstanceByMapId(m_currentPlayer->MapId);
+@@ -257,6 +435,12 @@
+                 data << m_currentPlayer->MapId << m_currentPlayer->RecoveryPosition << float(0);
+ 				SendPacket(&data);
+ 				data.clear();
++			} else {
++				data << uint8(CHAR_LOGIN_NO_WORLD);
++				SendPacket(&data);
++				sClientMgr.DestroyRPlayerInfo((uint32)guid);
++				ClearCurrentPlayer();
++				return;
+ 			}
+ 		}
+ 	}
+@@ -271,6 +455,10 @@
+ 		m_currentPlayer = NULL;
+ 		return;
+ 	}
++		
++	//megai2: проверочки 
++	if (IS_BG_MAP(m_currentPlayer->MapId))
++		m_currentPlayer->onBg = true;
+ 
+ 	/* log the player into that WS */
+ 	data.SetOpcode(ISMSG_PLAYER_LOGIN);
+@@ -280,9 +468,13 @@
+ 
+ 	/* append the account information */
+ 	data << uint32(m_accountId) << uint32(m_accountFlags) << uint32(m_sessionId)
+-		<< m_GMPermissions << m_accountName;
++		<< m_GMPermissions << m_accountName << m_lang;
+ 
++	p->Pack(data);
++
++	lastPing = 0;
++
++	m_nextServer = dest->Server;
+ 	dest->Server->SendPacket(&data);
+-	m_nextServer = dest->Server;
+ }
+ 
+Index: WorkerOpcodes.h
+===================================================================
+--- WorkerOpcodes.h	(revision 824)
++++ WorkerOpcodes.h	(working copy)
+@@ -34,20 +34,35 @@
+ 	ICMSG_PLAYER_INFO					= 10,
+ 	ISMSG_WOW_PACKET					= 11,
+ 	ICMSG_WOW_PACKET					= 12,
+-	ICMSG_WHISPER						= 13,
+-    ICMSG_CHAT							= 14,
+-	ISMSG_WHISPER						= 15,
+-	ISMSG_CHAT							= 16,
+-	ISMSG_PACKED_PLAYER_INFO			= 17,
+-	ICMSG_PLAYER_LOGIN_RESULT			= 18,
+-	ICMSG_PLAYER_LOGOUT					= 19,
+-	ISMSG_DESTROY_PLAYER_INFO			= 20,
+-	ICMSG_TELEPORT_REQUEST				= 21,
+-	ISMSG_TELEPORT_RESULT				= 22,
+-	ISMSG_PLAYER_CHANGED_SERVERS		= 23,
+-	ISMSG_PLAYER_CHANGE_INSTANCES		= 24,
+-	ISMSG_CREATE_PLAYER					= 25,
+-	ICMSG_PLAYER_CHANGE_SERVER_INFO		= 26,
++    ICMSG_CHAT							= 13,
++	ISMSG_CHAT							= 14,
++	ISMSG_PACKED_PLAYER_INFO			= 15,
++	ICMSG_PLAYER_LOGIN_RESULT			= 16,
++	ICMSG_PLAYER_LOGOUT					= 17,
++	ISMSG_DESTROY_PLAYER_INFO			= 18,
++	ICMSG_TELEPORT_REQUEST				= 19,
++	ISMSG_TELEPORT_RESULT				= 20,
++	ISMSG_PLAYER_CHANGED_SERVERS		= 21,
++	ISMSG_PLAYER_CHANGE_INSTANCES		= 22,
++	ISMSG_CREATE_PLAYER					= 23,
++	ICMSG_PLAYER_CHANGE_SERVER_INFO		= 24,
++	ICMSG_PONG							= 25,
++	ISMSG_PING                          = 26,
++	ICMSG_GUID_INCREMENT                = 27,
++	ISMSG_GUID_INCREMENTED              = 28,
++	ISMSG_PLAYER_CREATE                 = 29,
++	ICMSG_PLAYER_CREATED                = 30,
++	ISMSG_PLAYER_CREATED				= 31,
++	ISMSG_PARTY_UPDATE					= 32,
++	ICMSG_GUILD_DISBAND					= 33,
++	ISMSG_GUILD_DISBAND					= 34,
++	ICMSG_MAIL_UPDATE					= 35,
++	ISMSG_MAIL_UPDATE					= 36,
++	ICMSG_INSTANCE_CREATED              = 37,
++	ISMGS_INSTANCE_BOOT                 = 38,
++	ICMSG_UPDATE_GUILD_NAMES            = 39,
++	ICMSG_PARTY_UPDATE                  = 40,
++	ISMSG_INITIALIZE_GUIDS              = 41,
+ 
+ 	IMSG_NUM_TYPES,
+ };
+Index: AddonMgr.h
+===================================================================
+--- AddonMgr.h	(revision 0)
++++ AddonMgr.h	(working copy)
+@@ -0,0 +1,56 @@
++/*
++ * ArcEmu MMORPG Server
++ * Copyright (C) 2005-2007 Ascent Team <http://www.ascentemu.com/>
++ * Copyright (C) 2008 <http://www.ArcEmu.org/>
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU Affero General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Affero General Public License for more details.
++ *
++ * You should have received a copy of the GNU Affero General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ *
++ */
++
++#ifndef __ADDONMGR_H
++#define __ADDONMGR_H
++
++struct AddonEntry
++{
++	std::string name;
++	uint64 crc;
++	bool banned;
++	bool isNew;
++	bool showinlist;
++};
++
++class AddonMgr :  public Singleton < AddonMgr >
++{
++public:
++	AddonMgr();
++	~AddonMgr();
++
++	void LoadFromDB();
++	void SaveToDB();
++
++	void SendAddonInfoPacket(WorldPacket *source, uint32 pos, Session *m_session);
++	bool AppendPublicKey(WorldPacket& data, string AddonName, uint32 CRC);
++
++private:
++	std::map<std::string, AddonEntry*> KnownAddons;
++	map<string, ByteBuffer> AddonData;
++
++	bool IsAddonBanned(uint64 crc, std::string name = "");
++	bool IsAddonBanned(std::string name, uint64 crc = 0);
++	bool ShouldShowInList(std::string name);
++};
++
++#define sAddonMgr AddonMgr::getSingleton()
++
++#endif
+Index: Master.h
+===================================================================
+--- Master.h	(revision 824)
++++ Master.h	(working copy)
+@@ -23,6 +23,11 @@
+ extern Database * Database_World;
+ extern Database * Database_Character;
+ 
++extern ServerConf sConfig;
++extern GuidInfo sGuidInfo;
++
++extern std::string realmName;
++
+ #define WorldDatabase (*Database_World)
+ #define CharacterDatabase (*Database_Character)
+ 
+Index: WorkerServer.cpp
+===================================================================
+--- WorkerServer.cpp	(revision 824)
++++ WorkerServer.cpp	(working copy)
+@@ -19,34 +19,287 @@
+ 
+ #include "RStdAfx.h"
+ 
+-WServerHandler WServer::PHandlers[IMSG_NUM_TYPES];
++//megai2: максимальное время ожидания ответа
++#define MAX_PONG_TIME 90
++//megai2: каждые 20с
++#define PING_INTERVAL 20
+ 
++WServerHandler  WServer::PHandlers[IMSG_NUM_TYPES];
++WServerHandlerW WServer::WHandlers[NUM_MSG_TYPES];
++
+ void WServer::InitHandlers()
+ {
+ 	memset(PHandlers, 0, sizeof(void*) * IMSG_NUM_TYPES);
+ 	PHandlers[ICMSG_REGISTER_WORKER] = &WServer::HandleRegisterWorker;
+ 	PHandlers[ICMSG_WOW_PACKET] = &WServer::HandleWoWPacket;
+ 	PHandlers[ICMSG_PLAYER_LOGIN_RESULT] = &WServer::HandlePlayerLoginResult;
+-	PHandlers[ICMSG_PLAYER_LOGOUT] = &WServer::HandlePlayerLogout;
++	//PHandlers[ICMSG_PLAYER_LOGOUT] = &WServer::HandlePlayerLogout;//SMSG_LOGOUT_COMPLETE
+ 	PHandlers[ICMSG_TELEPORT_REQUEST] = &WServer::HandleTeleportRequest;
++	PHandlers[ICMSG_PONG] = &WServer::HandlePong;
++	PHandlers[ICMSG_PLAYER_CHANGE_SERVER_INFO] = &WServer::HandlePlayerChangeServerInfo;
++	PHandlers[ICMSG_PLAYER_INFO] = &WServer::HandlePlayerInfoUpdate;
++	PHandlers[ICMSG_GUID_INCREMENT] = &WServer::HandleGuidIncrement;
++	PHandlers[ICMSG_PLAYER_CREATED] = &WServer::HandlePlayerCreated;
++	PHandlers[ICMSG_GUILD_DISBAND] = &WServer::HandleGuildDisband;
++	PHandlers[ICMSG_MAIL_UPDATE] = &WServer::HandleMailUpdate;
++	PHandlers[ICMSG_INSTANCE_CREATED] = &WServer::HandleInstanceCreated;
++	PHandlers[ICMSG_UPDATE_GUILD_NAMES] = &WServer::HandleGuildNameUpdate;
++	PHandlers[ICMSG_PARTY_UPDATE] = &WServer::HandlePartyUpdate;
++
++	memset(WHandlers, 0, sizeof(void*) * NUM_MSG_TYPES);
++	WHandlers[SMSG_LOGOUT_COMPLETE] = &WServer::HandlePlayerLogout;
++	WHandlers[SMSG_LOOT_START_ROLL] = &WServer::HandleRollOps;
++	WHandlers[SMSG_LOOT_ROLL] = &WServer::HandleRollOps;
++	WHandlers[SMSG_LOOT_ALL_PASSED] = &WServer::HandleRollOps;
++	WHandlers[SMSG_LOOT_ROLL_WON] = &WServer::HandleRollOps;
++	WHandlers[SMSG_ITEM_PUSH_RESULT] = &WServer::HandleRollOps;
+ }
+ 
+ WServer::WServer(uint32 id, WSSocket * s) : m_id(id), m_socket(s)
+ {
++	m_deleted = false;
++	actQu = false;
++	lastPing = (uint32)UNIXTIME - PING_INTERVAL;
++	lastPong = (uint32)UNIXTIME;
++	latency = 0;
++}
+ 
++WServer::~WServer(){
++	//megai2: ищем себя и удаляем
++	Log.Debug("WServer", "Worker %u has closed socket, cleanup", m_id);
++	for(uint32 j = 1; j <= sClientMgr.GetSessionsCount(); ++j)
++	{
++		Session * currSess = sClientMgr.GetSession(j);
++		//megai2: так должно работать т.к. обновления сессий и серверов идут в одном потоке
++		if(currSess && currSess->GetServer() == this) {
++			Log.Debug("World socket", "Removing player from session %u", j);
++			LogoutPlayer(j, LS_LOGOUT); 
++		} 
++		if (currSess && ((currSess->GetTeleportPendingSID() == m_id) || (currSess->GetNextServer() == this)))
++		{
++			if (currSess->GetOldServer())
++			{
++				WorldPacket data = WorldPacket(SMSG_TRANSFER_ABORTED, 4); 
++				data << uint32(0x02); 
++				currSess->SendPacket(&data);
++				currSess->SetNextServerValue(NULL);
++				currSess->SetServer(currSess->GetOldServer());
++			} else {
++				//megai2: на случай если сервер падает во время загрузки
++				WorldPacket data = WorldPacket(SMSG_CHARACTER_LOGIN_FAILED, 4); 
++				data << uint8(CHAR_LOGIN_NO_WORLD);
++				currSess->SendPacket(&data);
++				if (currSess->GetPlayer())
++					sClientMgr.DestroyRPlayerInfo(currSess->GetPlayer()->Guid);
++				currSess->ClearCurrentPlayer();
++				currSess->ClearServers();
++			}
++		}
++		if (currSess && currSess->GetOldServer() == this)
++			currSess->SetOldServer(NULL);
++	}
++	m_instances.clear();
+ }
+ 
++void WServer::HandlePartyUpdate(WorldPacket & pck)
++{
++	uint32 session = 0;
++
++	pck >> session;
++
++	if (!sClientMgr.GetSession(session))
++		return;
++
++	Session* srcSess = sClientMgr.GetSession(session);
++	RPlayerInfo* srcPlr = srcSess->GetPlayer();
++
++	WorldPacket* data = new WorldPacket(SMSG_PARTY_MEMBER_STATS, 500);
++
++	uint8* buf = new uint8[pck.size()-4];
++	pck.read(buf, pck.size()-4);
++
++	data->append(buf, pck.size()-4);
++	data->wpos(0);
++	data->rpos(0);
++
++	if (srcPlr && srcPlr->m_Group)
++	{
++		Group* pGroup = srcPlr->m_Group;
++		for(int32 i = 0; i < 1 + 7 * pGroup->groupType; ++i)
++			for(uint32 j = 0; j < 5; ++j)
++			{	
++				if (!pGroup->members[i][j])
++					continue;
++
++				RPlayerInfo* dstPlr = sClientMgr.GetRPlayer(pGroup->members[i][j]);
++				Session * dstSess = NULL;
++
++				//megai2: если есть игрок значит в любом случае есть сессия
++				if (!dstPlr)
++					continue;
++
++				dstSess = sClientMgr.GetSession(dstPlr->Sessid);
++
++				dstSess->SendPacket(data);	
++			}
++	}
++}
++
++void WServer::HandleGuildDisband(WorldPacket & pck)
++{
++	//нет нужды обновлять RPlayerInfo, поскольку на текущем сервере это уже сделано, 
++	// а на остальных таким же образом будет сделано.
++	pck.SetOpcode(ISMSG_GUILD_DISBAND);
++	sClusterMgr.DistributePacketToAll(&pck, this);
++}
++
++void WServer::HandleMailUpdate(WorldPacket & pck)
++{
++	uint32 guid;
++	pck >> guid;
++	RPlayerInfo *receiver = sClientMgr.GetRPlayer(guid);
++	if(!receiver)
++		return;
++	WServer* dstServer = sClientMgr.GetSession(receiver->Sessid)->GetServer();
++
++	if (!dstServer)
++		return;
++	
++	pck.rpos(0);
++	pck.SetOpcode(ISMSG_MAIL_UPDATE);
++	dstServer->SendPacket(&pck);
++}
++
++void WServer::HandlePong(WorldPacket & pck)
++{
++	//megai2: от сервера до клиента, время от клиента до сервера не учитываеться
++	pck >> latency;
++}
++
++void WServer::HandlePlayerCreated(WorldPacket & pck)
++{
++	uint32 acct;
++	Session * sess;
++	uint8 res;
++	pck >> acct >> res;
++
++	sClientMgr.bCharCreate = false;
++
++	sess = sClientMgr.GetSessionByAcc(acct);
++	if (!sess)
++		return;
++
++	if (res == E_CHAR_CREATE_SUCCESS)
++	{
++		WorldPacket data(ISMSG_PLAYER_CREATED, 300);
++
++		uint8* buf = new uint8[pck.size()-5];
++		pck.read(buf, pck.size()-5);
++
++		data.append(buf, pck.size()-5);
++		data.wpos(0);
++		data.rpos(0);
++	
++		sClusterMgr.DistributePacketToAll(&data, this);
++	}
++
++	sess->OutPacket(SMSG_CHAR_CREATE, 1, &res);
++}
++
++void WServer::HandleGuildNameUpdate(WorldPacket & pck)
++{
++	uint32 guid;
++	std::string name;
++
++	pck >> guid >> name;
++
++	if (sClientMgr.m_guildNames.find(guid) != sClientMgr.m_guildNames.end())
++		return;
++
++	sClientMgr.m_guildNames.insert(make_pair(guid, name));
++}
++
++void WServer::HandleInstanceCreated(WorldPacket & pck)
++{
++	uint32 IID = 0;
++	uint32 map = -1;
++	uint32 res = 0;
++	uint32 j = 1;
++
++	pck >> IID >> map >> res;
++
++	Log.Success("WServer", "Created instance %u map %u result %u", IID, map, res);
++
++	if (!sClusterMgr.GetInstanceByInstanceId(IID) && IS_BG_MAP(map))
++		sClusterMgr.AppendInstance(IID, map, this);
++
++	if (res && sClusterMgr.GetInstanceByInstanceId(IID))
++		sClusterMgr.GetInstanceByInstanceId(IID)->loading = false;
++
++	//megai2: во время апдейта количество сессий не увеличиваеться
++	for (uint32 i = 1; i <= sClientMgr.GetSessionsCount(); ++i) 
++	{
++		Session* sess = sClientMgr.GetSession(i);
++		if (sess == NULL)
++			continue;
++
++		if (sess->GetTeleportPendingSID() == m_id && sess->GetTeleportPendingIID() == IID)
++		{
++			//megai2: порт или снятие пендинга с ошибкой %)	
++			if (res && sess->GetTeleportPendingPck() && sess->GetServer())
++				sess->GetServer()->HandleTeleportRequest(*sess->GetTeleportPendingPck());
++			else {
++				WorldPacket data = WorldPacket(SMSG_TRANSFER_ABORTED, 4); 
++				data << uint32(0x02); 
++				sess->SendPacket(&data);
++				sess->SetTeleportPending(NULL, 0, 0);//megai2: ну и все)
++			}
++		}
++	}
++}
++
+ void WServer::HandleRegisterWorker(WorldPacket & pck)
+ {
+-	vector<uint32> preferred;
++	vector<WorldInstanceInfo> preferred;
+ 	uint32 build;
+-	pck >> build >> preferred;
++	WorldInstanceInfo tmp;
++	pck >> build;
++	for (uint32 i = 1; i <= (pck.size() - 4) / 8; ++i) 
++	{
++		pck.read((uint8*)&tmp, 8);
++		preferred.push_back(tmp);
++	}
+ 
++	Log.Debug("WServer", "Server %u registred (build %u)", GetID(), build);
+ 	/* send a packed packet of all online players to this server */
+ 	sClientMgr.SendPackedClientInfo(this);
+ 
+ 	/* allocate initial instances for this worker */
+ 	sClusterMgr.AllocateInitialInstances(this, preferred);
++	if (preferred.empty())
++	{
++		type = WT_INSTANCE_WORLD;
++		QueryResult * result = CharacterDatabase.Query("SELECT `id`, `mapid` FROM instances");
++		if (result)
++		{
++			do 
++			{
++
++				Field* dt = result->Fetch();
++				sClusterMgr.CreateInstance(dt[0].GetInt32(), dt[1].GetInt32());
++
++			} while(result->NextRow());
++		}
++		delete result;
++	}
++	else if(preferred.size() == 2)
++		type = WT_BATTLEGROUP_WORLD;
++	else
++		type = WT_CONTINENT;
++
++	WorldPacket data(ISMSG_REGISTER_RESULT, 4);
++	data << GetID();
++	SendPacket(&data);
+ }
+ 
+ void WServer::HandleWoWPacket(WorldPacket & pck)
+@@ -57,99 +310,398 @@
+ 	/* get session */
+ 	pck >> sessionid >> opcode >> size;
+ 	Session * session = sClientMgr.GetSession(sessionid);
+-	if(!session) return;
++	if(!session) 
++		return;
+ 
+ 	/* write it to that session's output buffer */
+ 	WorldSocket * s = session->GetSocket();
+-	if(s) s->OutPacket(opcode, size, size ? ((const void*)(pck.contents() + 10)) : 0);
++	if(s) 
++		s->OutPacket(opcode, size, size ? ((const void*)(pck.contents() + 10)) : 0);
+ }
+ 
+-void WServer::HandlePlayerLogout(WorldPacket & pck)
++void WServer::HandleWoWPacket(uint32 op, uint32 sessionid, WorldPacket & pck)
+ {
+-	uint32 sessionid, guid;
+-	pck >> sessionid >> guid;
+-	RPlayerInfo * pi = sClientMgr.GetRPlayer(guid);
+-	Session * s = sClientMgr.GetSession(sessionid);
++	Session * session = sClientMgr.GetSession(sessionid);
++	if(!session)
++		return;
++
++	/* write it to that session's output buffer */
++	WorldSocket * s = session->GetSocket();
++	if(s)
++		s->OutPacket(op, pck.size(), pck.size() ? ((const void*)(pck.contents() + 10)) : 0);
++}
++
++void WServer::HandlePlayerInfoUpdate(WorldPacket & pck)
++{
++	if (pck.size() < 9)
++		return;
++	uint32 guid;
++	uint32 value;
++	uint8 idx;
++
++	pck >> guid >> idx >> value;
++
++	if (!sClientMgr.GetRPlayer(guid))
++		return;
++
++	RPlayerInfo * plr = sClientMgr.GetRPlayer(guid);
++	//megai2: делаю свитчем - мало ли что потом придется приделать
++	switch (idx) 
++	{
++		case UI_LEVEL:
++			{
++				plr->Level = value;
++			}break;
++		case UI_GUILD:	
++			{
++				plr->GuildId = value;
++			}break;
++		case UI_ZONE:
++			{
++				plr->ZoneId = value;
++			}break;
++		case UI_GMTAG:
++			{
++				//megai2: ><
++				plr->bGMTag = value;
++			}break;
++		case UI_GUILDR:
++			{
++				plr->GuildPrem = value;
++			}break;
++		case UI_GINVITER:
++			{
++				plr->guildinviter = value;
++			}break;
++		default:
++			return;
++		break;
++	}		
++
++	WorldPacket* data = new WorldPacket(ISMSG_PLAYER_INFO, 300);
++	plr->Pack(*data);
++	sClusterMgr.DistributePacketToAll(data, this);
++	//Log.Debug("WServer", "Updated  playerinfo of player %u (idx %u): set %i", guid, idx, value);
++}
++
++void WServer::LogoutPlayer(uint32 session, LogoutSrc src)
++{
++	Session * s = sClientMgr.GetSession(session);
++
++	RPlayerInfo * pi = NULL;
++	if (s)
++		pi = s->GetPlayer();
++
+ 	if(pi && s)
+ 	{
++
+ 		/* tell all other servers this player has gone offline */
+ 		WorldPacket data(ISMSG_DESTROY_PLAYER_INFO, 4);
+-		data << guid;
+-		sClusterMgr.DistributePacketToAll(&data, this);
++		data << pi->Guid << session;
++		sClusterMgr.DistributePacketToAll(&data);
+ 
+-		/* clear the player from the session */
+-		s->ClearCurrentPlayer();
+-		s->ClearServers();
++		if (src == LS_LOGOUT)
++		{
++			Log.Debug("WServer","Hooked SMSG_LOGOUT_COMPLETE to session %u", session);
+ 
+-		/* destroy the playerinfo struct here */
+-		sClientMgr.DestroyRPlayerInfo(guid);
+-	}
++			/* clear the player from the session */
++			s->ClearCurrentPlayer();
++			s->ClearServers();
++
++			Group * pGroup = pi->m_Group;
++
++			if (pGroup && pi->Guid == pGroup->leader)
++			{
++				for(int32 i = 0; i < 1 + 7 * pGroup->groupType; ++i)
++					for(uint32 j = 0; j < 5; ++j)								
++						if (pGroup->members[i][j] && pGroup->members[i][j] != pi->Guid && sClientMgr.GetRPlayer(pGroup->members[i][j]))
++						{
++							pGroup->leader = pGroup->members[i][j];
++						}
++				RPlayerInfo* lead = sClientMgr.GetRPlayer(pGroup->leader);
++				if (lead)
++				{
++					WorldPacket data( SMSG_GROUP_SET_LEADER, lead->Name.length() + 1 );
++					data << lead->Name;
++					for(int32 i = 0; i < 1 + 7 * pGroup->groupType; ++i)
++						for(uint32 j = 0; j < 5; ++j)
++						{	
++							if (sClientMgr.GetRPlayer(pGroup->members[i][j]) && pGroup->members[i][j] != pi->Guid)
++								sClientMgr.GetSession(sClientMgr.GetRPlayer(pGroup->members[i][j])->Sessid)->SendPacket(&data);	
++						}		
++				}
++			}
++
++			/* destroy the playerinfo struct here */
++			sClientMgr.DestroyRPlayerInfo(pi->Guid);
++
++			//megai2: обновляем группу %)
++			if (pGroup)
++			{
++				for(int32 i = 0; i < 1 + 7 * pGroup->groupType; ++i)
++					for(uint32 j = 0; j < 5; ++j)
++						if (pGroup->members[i][j] && sClientMgr.GetRPlayer(pGroup->members[i][j]))
++						{
++							sClientMgr.GetSession(sClientMgr.GetRPlayer(pGroup->members[i][j])->Sessid)->GroupUpdate();
++							break;
++						}
++			}
++
++			WorldPacket nullPck(0);
++			HandleWoWPacket(SMSG_LOGOUT_COMPLETE, session, nullPck);
++		}
++	} 
+ }
+ 
++void WServer::HandleRollOps(WorldPacket & pck, uint32 session)
++{
++	//megai2: лут виден тока на той мапе на которой убит моб
++	if (!sClientMgr.GetSession(session))
++		return;
++
++	Session* srcSess = sClientMgr.GetSession(session);
++	RPlayerInfo* srcPlr = srcSess->GetPlayer();
++
++	if (srcPlr && srcPlr->m_Group)
++	{
++		Group* pGroup = srcPlr->m_Group;
++		for(int32 i = 0; i < 1 + 7 * pGroup->groupType; ++i)
++			for(uint32 j = 0; j < 5; ++j)
++			{	
++				if (!pGroup->members[i][j])
++					continue;
++
++				RPlayerInfo* dstPlr = sClientMgr.GetRPlayer(pGroup->members[i][j]);
++				Session * dstSess = NULL;
++
++				//megai2: если есть игрок значит в любом случае есть сессия
++				if (!dstPlr)
++					continue;
++
++				dstSess = sClientMgr.GetSession(dstPlr->Sessid);
++
++				//megai2: все игроки на данной карте =)
++				if (dstSess->GetServer() != srcSess->GetServer() || dstPlr->InstanceId != srcPlr->InstanceId 
++					|| dstPlr->MapId != srcPlr->MapId)
++					continue;
++				
++				dstSess->SendPacket(&pck);	
++			}
++	} else if (srcPlr)
++		srcSess->SendPacket(&pck);	
++}
++
++void WServer::HandlePlayerLogout(WorldPacket & pck, uint32 session)
++{
++	if (sClientMgr.GetSession(session) && !sClientMgr.GetSession(session)->GetNextServer() && sClientMgr.GetSession(session)->GetServer() == this)
++		LogoutPlayer(session, LS_LOGOUT);
++}
++
++void WServer::HandleGuidIncrement(WorldPacket & pck)
++{
++	//megai2: инкремент!
++	uint8 type;
++	uint32 val;
++	pck >> type;
++	if (type == GT_CONTAINER)
++		val = ++sGuidInfo.m_hiContainerGuid[GetID()-1];
++	else if (type == GT_ITEM)
++		val = ++sGuidInfo.m_hiItemGuid[GetID()-1];
++	else if(type == GT_PLAYER)
++		val = ++sGuidInfo.m_hiPlayerGuid[GetID()-1];	
++	else if(type == GT_GUILD)
++		val = ++sGuidInfo.m_hiGuildGuid[GetID()-1];
++	else if (type == GT_AUCTION)
++		val = ++sGuidInfo.m_auctionGuid[GetID()-1];
++	else
++		val = ++sGuidInfo.m_mailGuid[GetID()-1];
++
++	Log.Debug("WServer", "Incremented guid %u to %u by server %u request", type, val, GetID());
++
++	/*WorldPacket* data = new WorldPacket(ISMSG_GUID_INCREMENTED, 9);
++	*data << type << val << GetID();
++	sClusterMgr.DistributePacketToAll(data);
++	delete data;*/
++}
++
+ void WServer::HandleTeleportRequest(WorldPacket & pck)
+ {
+ 	WorldPacket data(ISMSG_TELEPORT_RESULT, 100);
+ 	RPlayerInfo * pi;
+ 	Session * s;
+-	Instance * dest;
+-	uint32 mapid, sessionid, instanceid;
++	Instance * dest = NULL;
++	uint32 mapid, sessionid, instanceid, wserverid;
+ 
+ 	/* this packet is only used upon changing main maps! */
+-	pck >> sessionid >> mapid >> instanceid;	
++	pck >> sessionid >> mapid >> instanceid;
+ 
++	wserverid = GetID();
++
+ 	s = sClientMgr.GetSession(sessionid);
+ 	if(s)
+ 	{
+ 		pi = s->GetPlayer();
+ 		ASSERT(pi);
+ 
++		//megai2: пыщь!
++#define ABORT_TRANSFER { data.Initialize(SMSG_TRANSFER_ABORTED); data << uint32(0x02); s->SendPacket(&data); data << sessionid << uint8(2); SendPacket(&data); return; }
++
++		if (mapid > NUM_MAPS)
++			ABORT_TRANSFER
++
+ 		/* find the destination server */
+-		if(instanceid == 0)
+-			dest = sClusterMgr.GetInstanceByMapId(mapid);
++		//megai2: нету сервера ничего не создаем %)
++		if(IS_BG_MAP(mapid) && mapid != 449 && mapid != 450)
++		{
++			//megai2: на случай если мир сразу портает в инст
++			if (!sClusterMgr.GetInstanceByInstanceId(instanceid))
++			{
++				//megai2: нене не портаем %)
++				//s->SetTeleportPending(&pck, dest->Server->GetID(), dest->InstanceId);
++				ABORT_TRANSFER
++			} else
++				dest = sClusterMgr.GetInstanceByInstanceId(instanceid);
++		}else
++		if(!IS_MAIN_MAP(mapid) && sClusterMgr.GetWorkerServerForNewInstance())
++		{
++			MapInfo* mInf = WorldMapInfoStorage.LookupEntry(mapid);
++
++			if ((!mInf || !mInf->HasFlag(0x1/*WMI_INSTANCE_ENABLED*/)) ||
++				(mInf->minlevel > pi->Level) ||//megai2: проверка уровня
++				(pi->m_Group && pi->m_Group->difficulty >= MODE_HEROIC && mInf->type != INSTANCE_MULTIMODE && mInf->type != INSTANCE_NULL) ||//проверка доступности хероика
++				(mInf->type == INSTANCE_RAID && (!pi->m_Group || (pi->m_Group && pi->m_Group->groupType != GROUP_TYPE_RAID))) ||//проверка рейда
++				(mInf->type == INSTANCE_MULTIMODE && !pi->m_Group) ||//проверка группы
++				(pi->Level<80 && pi->m_Group && pi->m_Group->difficulty >= MODE_HEROIC && mInf->type == INSTANCE_MULTIMODE))//проверка лвла для героика
++					ABORT_TRANSFER
++
++			//megai2: без группы создавать инсты - нельзя
++			if (pi->m_Group && pi->m_Group->instanceIds[mapid][pi->m_Group->difficulty] > 0)
++			{
++				dest = sClusterMgr.GetInstanceByInstanceId(pi->m_Group->instanceIds[mapid][pi->m_Group->difficulty]);
++				//megai2: а если нету по какой либо причине?
++				if (!dest)
++				{
++					if (!pi->m_Group)
++						ABORT_TRANSFER
++					dest = sClusterMgr.CreateInstance(0, mapid, bool(pi->m_Group->difficulty == MODE_HEROIC));
++				}
++			} else  {
++				if (!pi->m_Group)
++					ABORT_TRANSFER
++				dest = sClusterMgr.CreateInstance(0, mapid, bool(pi->m_Group->difficulty == MODE_HEROIC));
++			}
++		} else if(IS_MAIN_MAP(mapid))
++			dest = sClusterMgr.GetInstanceByMapId(mapid);		
+ 		else
+-			dest = sClusterMgr.GetInstanceByInstanceId(instanceid);
++			ABORT_TRANSFER
+ 
+-		/* server up? */
+-		if(!dest)
++		if (!dest || !dest->Server)
++			ABORT_TRANSFER
++
++#undef ABORT_TRANSFER
++
++		//megai2: место назначения найдено - биндим
++		if (pi->m_Group)
++			pi->m_Group->instanceIds[mapid][pi->m_Group->difficulty] = dest->InstanceId;
++
++		//megai2: ещё грузица
++		if (dest->loading)
+ 		{
+-			data.Initialize(SMSG_TRANSFER_ABORTED);
+-			data << uint32(0x02);	// INSTANCE_ABORT_NOT_FOUND
+-			s->SendPacket(&data);
++			WorldPacket* pndPck = new WorldPacket(pck);
++			s->SetTeleportPending(pndPck, dest->Server->GetID(), dest->InstanceId);
++			return;
+ 		}
+-		else
+-		{
+-			/* server found! */
+-			LocationVector vec;
+-			pck >> vec >> vec.o;
+ 
+-			pi->MapId = mapid;
+-			pi->InstanceId = dest->InstanceId;
+-			pi->PositionX = vec.x;
+-			pi->PositionY = vec.y;
++		instanceid = dest->InstanceId;
+ 
+-			if(dest->Server == s->GetServer())
++		/* server found! */
++		LocationVector vec;
++		pck >> vec.x >> vec.y >> vec.z >> vec.o;
++
++		pi->MapId = mapid;
++		pi->InstanceId = instanceid;
++		pi->PositionX = vec.x;
++		pi->PositionY = vec.y;
++		pi->PositionZ = vec.z;
++
++		s->lastPingTime = (uint32)UNIXTIME;
++		s->lastPing = 0;
++		
++		/* notify the old server to pack the player info together to send to the new server, and delete the player */
++		//megai2: ждем когда придет PlayerChangeServerInfo
++		Log.Debug("WServer", "Player %s changing servers from %u to %u", pi->Name.c_str(), wserverid, dest->Server->GetID()); 
++		s->SetServer(NULL);
++		s->SetNextServerValue(dest->Server);
++		data << sessionid << uint8(0) << mapid << instanceid;
++		SendPacket(&data);
++		
++		s->SetTeleportPending(NULL, 0, 0);//megai2: очищяемс
++	}
++}
++
++void WServer::HandlePlayerChangeServerInfo(WorldPacket & pck)
++{
++	//megai2: удалились со старого сервера, прыгаем на новый
++	WorldPacket data(ISMSG_PLAYER_INFO, 100);
++	RPlayerInfo * pi;
++	Session * s;
++	uint32 sessionid;	
++	uint8 res;
++
++	pck >> res >> sessionid;	
++
++	s = sClientMgr.GetSession(sessionid);
++	if(s)
++	{
++		pi = s->GetPlayer();
++		ASSERT(pi);
++
++		//megai2: ну не можем мы удалиться со старого сервера, продолжаем его юзать
++		if (res != 0)
++		{
++			s->lastPing = 1;
++			s->lastPingTime = (uint32)UNIXTIME;
++			if (!s->GetOldServer())
+ 			{
+-				/* we're not changing servers, the new instance is on the same server */
+-				data << sessionid << uint8(1) << mapid << instanceid << vec << vec.o;
+-				SendPacket(&data);
++				sClientMgr.DestroyRPlayerInfo(pi->Guid);
++				data.Initialize(SMSG_CHARACTER_LOGIN_FAILED);
++				data << uint8(CHAR_LOGIN_NO_WORLD);
++				s->SendPacket(&data);
++				s->ClearCurrentPlayer();
++				s->ClearServers();	
++			} else {
++				data.Initialize(SMSG_TRANSFER_ABORTED); 
++				data << uint32(0x02); 
++				s->SendPacket(&data); 
++				s->SetServer(s->GetOldServer());
++				s->SetNextServerValue(NULL);
+ 			}
+-			else
+-			{
+-				/* notify the old server to pack the player info together to send to the new server, and delete the player */
+-				data << sessionid << uint8(0) << mapid << instanceid << vec << vec.o;
+-				SendPacket(&data);
+-			}
++			return;
++		}
+ 
+-			data.Initialize(ISMSG_PLAYER_INFO);
+-			pi->Pack(data);
+-			sClusterMgr.DistributePacketToAll(&data, this);
++		data.Initialize(ISMSG_PLAYER_INFO);
++		pi->Pack(data);
++		sClusterMgr.DistributePacketToAll(&data);
+ 
+-			data.Initialize(SMSG_NEW_WORLD);
+-			data << mapid << vec << vec.o;
+-			s->SendPacket(&data);
+-		}
++		float orient = 0;
++
++		data.Initialize(SMSG_NEW_WORLD);
++		data << pi->MapId << pi->PositionX << pi->PositionY << pi->PositionZ << orient;
++		s->SendPacket(&data);
++
++		Log.Debug("WServer", "Player %s logged out from old server sending logon message to new server", pi->Name.c_str());
++
++		//megai2: обновляем пинг тайм, дискает иногда
++		s->lastPingTime = (uint32)UNIXTIME;
++		s->lastPing = 0;
++
++		//игрок поменял свой сервер, логиним его по уже имеющейся инфе
++		data.Initialize(ISMSG_PLAYER_CHANGED_SERVERS);
++		data << uint32(sessionid) << s->GetAccountName() << s->GetGMPremissions() << s->GetAccountFlags() << uint32(pi->Guid) << s->m_lang;
++		s->GetNextServer()->SendPacket(&data);
+ 	}
+ }
++
+ void WServer::HandlePlayerLoginResult(WorldPacket & pck)
+ {
+ 	uint32 guid, sessionid;
+@@ -161,15 +713,67 @@
+ 		Session * s = sClientMgr.GetSession(sessionid);
+ 		if(s)
+ 		{
++			s->lastPing = 1;
++			s->lastPingTime = (uint32)UNIXTIME;
+ 			/* update server */
++			Log.Debug("WServer", "Login session next serv %u", s->GetNextServer());
+ 			s->SetNextServer();
++
++			RPlayerInfo* pi = s->GetPlayer();
+ 			
++			//megai2: улучшить обработку логина
+ 			/* pack together a player info packet and distribute it to all the other servers */
+-			ASSERT(s->GetPlayer());
+-			
++			ASSERT(pi);
++
++			if (!pi)
++				return;
++
++			//megai2: раньше?
+ 			WorldPacket data(ISMSG_PLAYER_INFO, 100);
+-			s->GetPlayer()->Pack(data);
+-			sClusterMgr.DistributePacketToAll(&data, this);
++			pi->Pack(data);
++			sClusterMgr.DistributePacketToAll(&data);
++
++			if (IS_BG_MAP(pi->MapId))
++			{
++				pi->onBg = true;
++				if (pi->m_Group)
++				{
++					//megai2: конечно должно быть сделано лучше и оптимизированней... %)
++					pi->m_Group->RemoveMember(pi->Guid);
++
++					//megai2: походу это уже будет не нужно, т.к. все должно почиститься само )
++				/*	uint8 buffer[24];
++					memset(buffer, 0, 24);
++					s->OutPacket( SMSG_GROUP_LIST, 24, buffer );
++	
++					data.Initialize( SMSG_GROUP_DESTROYED);
++					s->SendPacket( &data );
++	
++					data.Initialize( SMSG_PARTY_COMMAND_RESULT );
++					data << uint32(2) << uint8(0) << uint32(0);  // you leave the group
++					s->SendPacket( &data );
++	
++					pi->m_Group = NULL;
++					pi->LootInfo = -1;*/
++
++					sClientMgr.SendPlayerUpdate(pi->Guid);
++
++					for(int32 i = 0; i < 1 + 7 * pi->m_Group->groupType; ++i)
++						for(uint32 j = 0; j < 5; ++j)
++						{	
++							if (pi->m_Group->members[i][j] && sClientMgr.GetRPlayer(pi->m_Group->members[i][j]))
++							{
++								sClientMgr.GetSession(sClientMgr.GetRPlayer(pi->m_Group->members[i][j])->Sessid)->GroupUpdate();
++								break;
++							}
++						}
++					
++					pi->m_Group = NULL;
++				}
++			} else {
++				pi->onBg = false;
++				s->GroupUpdate();//megai2: апдейт группы для того чтобы не было лагов с отображением
++			}
+ 		}
+ 	}
+ 	else
+@@ -178,6 +782,11 @@
+ 		Session * s = sClientMgr.GetSession(sessionid);
+ 		if(s)
+ 		{
++			s->lastPing = 1;
++			s->lastPingTime = (uint32)UNIXTIME;
++			WorldPacket data(SMSG_CHARACTER_LOGIN_FAILED, 2);
++			data << uint8(CHAR_LOGIN_NO_WORLD);
++			s->SendPacket(&data);
+ 			s->ClearCurrentPlayer();
+ 			s->ClearServers();
+ 		}
+@@ -190,14 +799,29 @@
+ {
+ 	WorldPacket * pck;
+ 	uint16 opcode;
+-	while((pck = m_recvQueue.Pop()))
++	if ((uint32)UNIXTIME - lastPing > PING_INTERVAL)
+ 	{
++		pck = new WorldPacket(ISMSG_PING, 4);
++		*pck << uint32(GetTickCount());
++		SendPacket(pck);
++		lastPing = (uint32)UNIXTIME;
++		delete pck;
++	}
++	while((pck = m_recvQueue[actQu].Pop()))
++	{
+ 		opcode = pck->GetOpcode();
+ 		if(opcode < IMSG_NUM_TYPES && WServer::PHandlers[opcode] != 0)
+ 			(this->*WServer::PHandlers[opcode])(*pck);
+ 		else
+ 			Log.Error("WServer", "Unhandled packet %u\n", opcode);
++
++		//megai2: удалять то тоже нужно о_О
++		delete pck;
+ 	}
++	actQu = !actQu;
++
++	if ((uint32)UNIXTIME - lastPong > MAX_PONG_TIME)
++		m_socket->Disconnect();
+ }
+ 
+ 
+Index: WorldSocket.cpp
+===================================================================
+--- WorldSocket.cpp	(revision 824)
++++ WorldSocket.cpp	(working copy)
+@@ -41,13 +41,17 @@
+ 	mSeed = rand() % 0xFFFFFFF0 + 10;
+ 	pAuthenticationPacket = NULL;
+ 	mRequestID = 0;
++	m_session = 0;
+ 	Authed = false;
+-	m_session = NULL;
+ }
+ 
+ WorldSocket::~WorldSocket()
+ {
+-
++	if (m_session) {
++		m_session->SetSocket(NULL);
++		m_session->SetDeleted();
++		m_session=NULL;
++	}
+ }
+ 
+ void WorldSocket::OnDisconnect()
+@@ -56,12 +60,14 @@
+ 	{
+ 		sLogonCommHandler.UnauthedSocketClose(mRequestID);
+ 		mRequestID = 0;
+-	} else 
+-		if (m_session)
+-		{
+-			m_session->SetSocket(NULL);
+-			sClientMgr.RemoveSession(m_session->GetSessionId());
+-		}
++	}
++	if (m_session) {
++		delLock.Acquire();
++		m_session->SetSocket(NULL);
++		m_session->SetDeleted();
++		m_session=NULL;
++		delLock.Release();
++	}
+ }
+ 
+ void WorldSocket::OutPacket(uint16 opcode, size_t len, const void* data)
+@@ -72,6 +78,20 @@
+ 
+ 	BurstBegin();
+ 
++	//megai2: мы не можем нарушать очередность пакетов
++	while( GetWriteBuffer().GetSpace() < (len+4) )
++	{
++		BurstEnd();
++#ifdef WIN32
++		WaitForSingleObject(GetCurrentThread(), 20);
++#else
++		sleep(20);
++#endif
++		if (!IsConnected())
++			return;
++		BurstBegin();
++	}	
++
+ 	// Encrypt the packet
+ 	// First, create the header.
+ 	ServerPktHeader Header;
+@@ -176,16 +196,6 @@
+ 	if(recvData.rpos() != recvData.wpos())
+ 		recvData.read((uint8*)lang.data(), 4);
+ 
+-	Session * session = sClientMgr.CreateSession(AccountID);
+-	if(session == NULL)
+-	{
+-		/* we are already logged in. send auth failed. (if anyone has a better error lemme know :P) */
+-		OutPacket(SMSG_AUTH_RESPONSE, 1, "\x0D");
+-		return;
+-	}
+-
+-	m_session = session;
+-	session->m_socket = this;
+     Sha1Hash sha;
+ 
+ 	uint8 digest[20];
+@@ -206,24 +216,53 @@
+ 		return;
+ 	}
+ 
++	Session * session = sClientMgr.CreateSession(AccountID);
++	if(session == NULL)
++	{
++		/* we are already logged in. send auth failed. (if anyone has a better error lemme know :P) */
++		OutPacket(SMSG_AUTH_RESPONSE, 1, "\x0D");
++		return;
++	}
++
++	m_session = session;
++	session->m_socket = this;
++
+ 	// Allocate session
+ 	m_session->m_accountFlags = AccountFlags;
+ 	m_session->m_GMPermissions = GMFlags;
+ 	m_session->m_accountId = AccountID;
+ 	m_session->m_latency = _latency;
+ 	m_session->m_accountName = AccountName;
++	m_session->m_lang = lang;
+ 
+ 	Log.Notice("Auth", "%s from %s:%u [%ums]", AccountName.c_str(), GetRemoteIP().c_str(), GetRemotePort(), _latency);
++
++	delLock.Acquire();
++
++	if (!(IsConnected() && m_session))
++	{
++		delLock.Release();	
++		return;
++	}
++
++	//megai2: редко m_session успевает обнулиться, походу гдето идет опережение %)
+ 	Authenticate();
++
++	delLock.Release();	
+ }
+ 
+ void WorldSocket::Authenticate()
+ {
+ 	ASSERT(pAuthenticationPacket);
++
++	sAddonMgr.SendAddonInfoPacket(pAuthenticationPacket, (uint32)pAuthenticationPacket->rpos(), m_session);
++
+ 	delete pAuthenticationPacket;
+ 	pAuthenticationPacket = 0;
+ 
+-	if(m_session->m_accountFlags & 8)
++	if(m_session->m_accountFlags & 10)
++		OutPacket(SMSG_AUTH_RESPONSE, 11, "\x0C\x30\x78\x00\x00\x00\x00\x00\x00\x00\x02");
++	else if(m_session->m_accountFlags & 8)
+ 		OutPacket(SMSG_AUTH_RESPONSE, 11, "\x0C\x30\x78\x00\x00\x00\x00\x00\x00\x00\x01");
+ 	else
+ 		OutPacket(SMSG_AUTH_RESPONSE, 11, "\x0C\x30\x78\x00\x00\x00\x00\x00\x00\x00\x00");
+@@ -241,6 +280,7 @@
+ 
+ 	*recvPacket >> ping;
+ 	*recvPacket >> _latency;
++
+ 	OutPacket(SMSG_PONG, 4, &ping);
+ }
+ 
+@@ -295,25 +335,16 @@
+ 		// Check for packets that we handle
+ 		switch(Packet->GetOpcode())
+ 		{
+-		case CMSG_PING:
+-			{
+-				if(!m_session)
+-				{
+-					_HandlePing(Packet);
+-					delete Packet;
+-				}
+-				else
+-					m_session->m_readQueue.Push(Packet);				
+-			}break;
+ 		case CMSG_AUTH_SESSION:
+ 			{
+ 				_HandleAuthSession(Packet);
+ 			}break;
+ 		default:
+ 			{
+-				if(m_session) 
+-					m_session->m_readQueue.Push(Packet);
+-				else
++				//megai2: посылать вов пакет к миру здесь было бы быстрее, но мы можем спокойно потерять этот пакет ><
++				if(m_session)
++					m_session->m_readQueue[!m_session->actQu].Push(Packet);
++				else 
+ 					delete Packet;
+ 			}break;
+ 		}
+Index: QueryHandler.cpp
+===================================================================
+--- QueryHandler.cpp	(revision 824)
++++ QueryHandler.cpp	(working copy)
+@@ -19,6 +19,200 @@
+ 
+ #include "RStdAfx.h"
+ 
++void Session::HandleWhoOpcode(WorldPacket & pck)
++{
++	uint32 min_level;
++	uint32 max_level;
++	uint32 class_mask;
++	uint32 race_mask;
++	uint32 zone_count;
++	uint32 * zones = 0;
++	uint32 name_count;
++	string * names = 0;
++	string chatname;
++	string unkstr;
++	bool cname;
++	uint32 i;
++
++	pck >> min_level >> max_level;
++	pck >> chatname >> unkstr >> race_mask >> class_mask;
++	pck >> zone_count;
++
++	if(zone_count > 0 && zone_count < 10)
++	{
++		zones = new uint32[zone_count];
++	
++		for(i = 0; i < zone_count; ++i)
++			pck >> zones[i];
++	}
++	else
++	{
++		zone_count = 0;
++	}
++
++	pck >> name_count;
++	if(name_count > 0 && name_count < 10)
++	{
++		names = new string[name_count];
++
++		for(i = 0; i < name_count; ++i)
++			pck >> names[i];
++	}
++	else
++	{
++		name_count = 0;
++	}
++
++	if(chatname.length() > 0)
++		cname = true;
++	else
++		cname = false;
++
++	Log.Debug("Session", "Recvd CMSG_WHO Message with %u zones and %u names", zone_count, name_count );
++
++	if (!m_currentPlayer)
++		return;
++
++	bool gm = false;
++	uint32 team = m_currentPlayer->GetTeam();
++	if(HasGMPermissions())
++		gm = true;
++
++	uint32 sent_count = 0;
++	uint32 total_count = 0;
++
++	RPlayerInfo * plr;
++	uint32 lvl;
++	bool add;
++	WorldPacket data;
++	data.SetOpcode(SMSG_WHO);
++	data << uint64(0);
++	
++	for (uint32 i = 1; i <= sClientMgr.GetSessionsCount(); ++i) /* WhoList should display 49 names not including your own */
++	{
++		if (sent_count >= 49)
++			break;
++		Session * sess = sClientMgr.GetSession(i);
++		if (!sess)
++			continue;
++
++		plr = sess->GetPlayer();
++		if (!plr) 
++			continue;
++
++		/*if(!sWorld.show_gm_in_who_list && !HasGMPermissions())
++		{
++			if(plr->GetSession()->HasGMPermissions())
++				continue;
++		}*/
++
++		// Team check
++		if(!gm && plr->GetTeam() != team && !sess->HasGMPermissions())
++			continue;
++
++		++total_count;
++
++		// Add by default, if we don't have any checks
++		add = true;
++
++		// Chat name
++		if(cname && chatname != plr->Name)
++			continue;
++		
++		// Level check
++		lvl = plr->Level;
++		if(min_level && max_level)
++		{
++			// skip players outside of level range
++			if(lvl < min_level || lvl > max_level)
++				continue;
++		}
++
++		uint32 j;
++
++		// Zone id compare
++		if(zone_count)
++		{
++			// people that fail the zone check don't get added
++			add = false;
++			for(j = 0; j < zone_count; ++j)
++			{
++				if(zones[j] == plr->ZoneId)
++				{
++					add = true;
++					break;
++				}
++			}
++		}
++
++		// megai2: туду
++		if(!((class_mask >> 1) & (1 << (plr->Class - 1))) || !((race_mask >> 1) & (1 << (plr->Race - 1))))
++			add = false;
++		
++
++		// skip players that fail zone check
++		if(!add)
++			continue;
++
++
++		// name check
++		if(name_count)
++		{
++			// people that fail name check don't get added
++			add = false;
++			for(j = 0; j < name_count; ++j)
++			{
++				if(!strnicmp(names[j].c_str(), plr->Name.c_str(), names[j].length()))
++				{
++					add = true;
++					break;
++				}
++			}
++		}
++
++		if(!add)
++			continue;
++
++		// if we're here, it means we've passed all testing
++		// so add the names :)
++		//megai2: оригинальненько :D
++		//megai2: нубы, достали, пусть гладят кота
++		if (GetPlayer() && GetPlayer()->bGMTag)
++		{
++			if (sess->GetServer())
++				data << uint8(sess->GetServer()->GetID() + 0x30);
++			else
++				data << uint8(0x30);//megai2: грузимся ><
++			data << uint8(0x5F);
++		}
++
++		data << plr->Name.c_str();
++		if(plr->GuildId)
++			data << sClientMgr.GetGuildName(plr->GuildId);//todo: имя гильдии
++		else
++			data << uint8(0);	   // Guild name
++
++		data << plr->Level;
++		data << uint32(plr->Class);
++		data << uint32(plr->Race);
++		data << uint8(0);					// new string added in 2.4.0
++		data << uint32(plr->ZoneId);
++		++sent_count;
++	}
++	
++	data.wpos(0);
++	data << sent_count;
++	data << sent_count;
++
++	SendPacket(&data);
++	
++	// free up used memory
++	if(zones)
++		delete [] zones;
++	if(names)
++		delete [] names;
++}
++
+ void Session::HandleCreatureQueryOpcode(WorldPacket & pck)
+ {
+ 	WorldPacket data(SMSG_CREATURE_QUERY_RESPONSE, 150);
+Index: WorkerServerSocket.cpp
+===================================================================
+--- WorkerServerSocket.cpp	(revision 824)
++++ WorkerServerSocket.cpp	(working copy)
+@@ -20,7 +20,8 @@
+ #include "RStdAfx.h"
+ #include "svn_revision.h"
+ 
+-WSSocket::WSSocket(SOCKET fd) : Socket(fd, 100000, 100000)
++										   
++WSSocket::WSSocket(SOCKET fd) : Socket(fd, 1024576, 1024576)
+ {
+ 	_authenticated = false;
+ 	_remaining = 0;
+@@ -51,6 +52,15 @@
+ 	_authenticated = true;
+ }
+ 
++void WSSocket::OnDisconnect()
++{
++	if (_ws)
++	{
++		_ws->SetSocket(NULL);
++		_ws->SetDeleted();
++	}
++}
++
+ void WSSocket::OnRead()
+ {
+     for(;;)
+@@ -85,9 +95,9 @@
+ 
+ 			RemoveReadBufferBytes(sz + 10, false);*/
+ 
+-			uint32 sid;
+-			uint16 op;
+-			uint32 sz;
++			uint32 sid = 0;
++			uint16 op = 0;
++			uint32 sz = 0;
+ 			
+ 
+ 			GetReadBuffer().Read(&sid, 4);
+@@ -95,11 +105,21 @@
+ 			GetReadBuffer().Read(&sz, 4);
+ 		
+ 			Session * session = sClientMgr.GetSession(sid);
+-			if(session != NULL && session->GetSocket() != NULL)
++			if(session != NULL)
+ 			{
+ 				uint8* buf = new uint8[sz];
+ 				GetReadBuffer().Read(buf, sz);
+-				session->GetSocket()->OutPacket(op, sz, buf);
++				//Log.Debug("Network","Packet %u(size: %u) sended to session %u", op, sz, sid);
++				if ((_ws) && op < NUM_MSG_TYPES && (_ws->WHandlers[op])){//у нас свой хендлер
++					WorldPacket * pck = new WorldPacket(op, sz);
++					pck->resize(sz);
++					pck->wpos(0);
++					pck->append(buf, sz);
++					(_ws->*WServer::WHandlers[op])(*pck, sid);
++					delete pck;
++				}
++				else
++					session->OutPacket(op, sz, buf);
+ 				delete [] buf;
+ 			}
+ 			else
+@@ -178,6 +198,21 @@
+ 
+ 	BurstBegin();
+ 
++	//megai2: мы не можем нарушать очередность пакетов
++	while( GetWriteBuffer().GetSpace() < (size+6) )
++	{
++		BurstEnd();
++#ifdef WIN32
++		WaitForSingleObject(GetCurrentThread(), 20);
++#else
++		sleep(20);
++#endif
++		if (!IsConnected())
++			return;
++
++		BurstBegin();
++	}
++
+ 	// Pass the header to our send buffer
+ 	rv = BurstSend((const uint8*)&opcode, 2);
+ 	rv = BurstSend((const uint8*)&size, 4);
+@@ -203,6 +238,21 @@
+ 
+ 	BurstBegin();
+ 
++	//megai2: мы не можем нарушать очередность пакетов
++	while( GetWriteBuffer().GetSpace() < (size2+6) )
++	{
++		BurstEnd();
++#ifdef WIN32
++		WaitForSingleObject(GetCurrentThread(), 20);
++#else
++		sleep(20);
++#endif
++		if (!IsConnected())
++			return;
++
++		BurstBegin();
++	}
++
+ 	// Pass the header to our send buffer
+ 	BurstSend((const uint8*)&opcode2, 2);
+ 	BurstSend((const uint8*)&size2, 4);
+Index: ClusterManager.cpp
+===================================================================
+--- ClusterManager.cpp	(revision 824)
++++ ClusterManager.cpp	(working copy)
+@@ -31,6 +31,12 @@
+ 	WServer::InitHandlers();
+ }
+ 
++void ClusterMgr::DeleteWorkerServer(uint32 Idx)
++{
++	if (WorkerServers[Idx])
++		WorkerServers[Idx]->SetDeleted();
++}
++
+ WServer * ClusterMgr::GetServerByInstanceId(uint32 InstanceId)
+ {
+ 	InstanceMap::iterator itr = Instances.find(InstanceId);
+@@ -40,7 +46,10 @@
+ WServer * ClusterMgr::GetServerByMapId(uint32 MapId)
+ {
+ 	ASSERT(IS_MAIN_MAP(MapId));
+-	return SingleInstanceMaps[MapId]->Server;
++	if (SingleInstanceMaps[MapId])
++		return SingleInstanceMaps[MapId]->Server;
++	else
++		return NULL;
+ }
+ 
+ Instance * ClusterMgr::GetInstanceByInstanceId(uint32 InstanceId)
+@@ -55,8 +64,7 @@
+ 	return SingleInstanceMaps[MapId];
+ }
+ 
+-
+-WServer * ClusterMgr::CreateWorkerServer(WSSocket * s)
++void ClusterMgr::InsertWorkerServer(WServer * s)
+ {
+ 	/* find an id */
+ 	uint32 i;
+@@ -67,42 +75,73 @@
+ 	}
+ 
+ 	if(i == MAX_WORKER_SERVERS)
+-		return 0;		// No spaces
++		return;		// No spaces
+ 
+-	Log.Debug("ClusterMgr", "Allocating worker server %u to %s:%u", i, s->GetRemoteIP().c_str(), s->GetRemotePort());
+-	WorkerServers[i] = new WServer(i, s);
++	if (s->GetSocket() && s->GetSocket()->IsConnected())
++		Log.Debug("ClusterMgr", "Allocating worker server %u to %s:%u", i, s->GetSocket()->GetRemoteIP().c_str(), s->GetSocket()->GetRemotePort());
++
++	s->SetServerID(i);
++	WorkerServers[i] = s;
++
++	//megai2: грузим гуиды
++	WorldPacket data(ISMSG_INITIALIZE_GUIDS, 200);
++	data << uint32((GLOBAL_MAX_GUID / sGuidInfo.realmsCnt) * (sGuidInfo.globalOffset-1) + ((GLOBAL_MAX_GUID / sGuidInfo.realmsCnt) / MAX_ACTIVE_WS) * i);//megai2: whoot whoot
++	--i;//megai2: поправляем индекс
++	data << sGuidInfo.m_hiItemGuid[i] << sGuidInfo.m_hiPlayerGuid[i] << sGuidInfo.m_hiContainerGuid[i] << sGuidInfo.m_hiGuildGuid[i] << sGuidInfo.m_mailGuid[i] << sGuidInfo.m_auctionGuid[i];
++	s->SendPacket(&data);
++	
++	++i;//megai2: ещё раз
+ 	if(m_maxWorkerServer < i)
+ 		m_maxWorkerServer = i;
+-	return WorkerServers[i];
+ }
+ 
+-void ClusterMgr::AllocateInitialInstances(WServer * server, vector<uint32>& preferred)
++WServer * ClusterMgr::CreateWorkerServer(WSSocket * s)
+ {
+-	vector<uint32> result;
++	WServer * tmp = new WServer(0xFFFFFFFF, s);
++	m_wsInsertQueue.Push(tmp);
++	return tmp;
++}
++
++void ClusterMgr::AllocateInitialInstances(WServer * server, vector<WorldInstanceInfo>& preferred)
++{
++	for(uint32 a = 0; a < preferred.size(); a++)
++		Log.Debug("AllocateInitialInstances", "preferred contain instance %u, map %u", preferred[a].InstanceId, preferred[a].MapId);
++
++	vector<WorldInstanceInfo> result;
+ 	result.reserve(10);
+ 
+-	for(vector<uint32>::iterator itr = preferred.begin(); itr != preferred.end(); ++itr)
++	for(vector<WorldInstanceInfo>::iterator itr = preferred.begin(); itr != preferred.end(); ++itr)
+ 	{
+-		if(SingleInstanceMaps[*itr] == 0)
++		if(IS_MAIN_MAP(itr->MapId) && SingleInstanceMaps[itr->MapId] == 0)
+ 		{
+ 			result.push_back(*itr);
+ 		}
+ 	}
+ 
+-	for(vector<uint32>::iterator itr = result.begin(); itr != result.end(); ++itr)
++	for(vector<WorldInstanceInfo>::iterator itr = result.begin(); itr != result.end(); ++itr)
+ 	{
+-		CreateInstance(*itr, server);
++		CreateInstance(itr->MapId, server);
+ 	}
+ }
+ 
+ Instance * ClusterMgr::CreateInstance(uint32 MapId, WServer * server)
+ {
++	//вдруг уже создана.
++	if(IS_MAIN_MAP(MapId)) {
++		if(GetInstanceByMapId(MapId))
++			return GetInstanceByMapId(MapId);
++		else
++			;
++	} else
++		return NULL;
++
+ 	Instance * pInstance = new Instance;
+-	pInstance->InstanceId = ++m_maxInstanceId;
++	pInstance->InstanceId = 0;
+ 	pInstance->MapId = MapId;
+ 	pInstance->Server = server;
++	pInstance->loading = false;//megai2: сингл мапы всегда уже загружены
+ 
+-	Instances.insert( make_pair( pInstance->InstanceId, pInstance ) );
++	//Instances.insert( make_pair( pInstance->InstanceId, pInstance ) );
+ 
+ 	if(IS_MAIN_MAP(MapId))
+ 		SingleInstanceMaps[MapId] = pInstance;
+@@ -119,14 +158,14 @@
+ WServer * ClusterMgr::GetWorkerServerForNewInstance()
+ {
+     WServer * lowest = 0;
+-	int32 lowest_load = -1;
++	uint32 lowest_load = -1;
+ 
+ 	/* for now we'll just work with the instance count. in the future we might want to change this to
+ 	   use cpu load instead. */
+ 
+ 	for(uint32 i = 0; i < MAX_WORKER_SERVERS; ++i) {
+ 		if(WorkerServers[i] != 0) {
+-			if((int32)WorkerServers[i]->GetInstanceCount() < lowest_load)
++			if((WorkerServers[i]->GetInstanceCount() < lowest_load) && (WorkerServers[i]->type == WT_INSTANCE_WORLD))
+ 			{
+ 				lowest = WorkerServers[i];
+ 				lowest_load = int32(WorkerServers[i]->GetInstanceCount());
+@@ -138,12 +177,16 @@
+ }
+ 
+ /* create new instance based on template, or a saved instance */
+-Instance * ClusterMgr::CreateInstance(uint32 InstanceId, uint32 MapId)
++Instance * ClusterMgr::CreateInstance(uint32 InstanceId, uint32 MapId, bool heroic)
+ {
+ 	/* pick a server for us :) */
+ 	WServer * server = GetWorkerServerForNewInstance();
+-	if(!server) return 0;
++	if(!server) 
++		return 0;
+ 
++	if (InstanceId == 0)
++		InstanceId = m_maxInstanceId + 1;
++
+ 	ASSERT(GetInstance(InstanceId) == NULL);
+ 
+ 	/* bump up the max id if necessary */
+@@ -154,23 +197,66 @@
+ 	pInstance->InstanceId = InstanceId;
+ 	pInstance->MapId = MapId;
+ 	pInstance->Server = server;
++	pInstance->loading = true;
+ 
+ 	Instances.insert( make_pair( InstanceId, pInstance ) );
+ 
+ 	/* tell the actual server to create the instance */
+ 	WorldPacket data(ISMSG_CREATE_INSTANCE, 8);
+-	data << MapId << InstanceId;
++	data << MapId << InstanceId << uint8(heroic);
+ 	server->SendPacket(&data);
+ 	server->AddInstance(pInstance);
+ 	Log.Debug("ClusterMgr", "Allocating instance %u on map %u to server %u", pInstance->InstanceId, pInstance->MapId, server->GetID());
+ 	return pInstance;
+ }
+ 
++Instance * ClusterMgr::AppendInstance(uint32 InstanceId, uint32 MapId, WServer* ws)
++{
++    Instance * pInstance = new Instance;
++	pInstance->InstanceId = InstanceId;
++	pInstance->MapId = MapId;
++	pInstance->Server = ws;
++	pInstance->loading = false;
++
++	Instances.insert( make_pair( InstanceId, pInstance ) );
++
++	ws->AddInstance(pInstance);
++	Log.Debug("ClusterMgr", "Allocating instance %u on map %u to server %u", pInstance->InstanceId, pInstance->MapId, ws->GetID());
++	return pInstance;
++}
++
+ void ClusterMgr::Update()
+ {
++	WServer* insWS;
++	while((insWS = m_wsInsertQueue.Pop()))
++		InsertWorkerServer(insWS);	
+ 	for(uint32 i = 1; i <= m_maxWorkerServer; ++i)
+ 		if(WorkerServers[i])
+-			WorkerServers[i]->Update();
++			if (WorkerServers[i]->IsDeleted())
++			{
++				if (sClientMgr.bCharCreate == i)
++					sClientMgr.bCharCreate = false;
++				//megai2: хз как это делать, надо высвобождать память есчо %)
++				for(uint32 j = 0; j <= MAX_SINGLE_MAPID; ++j)
++				{
++					if ((SingleInstanceMaps[j] != NULL) && (SingleInstanceMaps[j]->Server == WorkerServers[i])) {
++						Log.Debug("ClusterMgr", "Removing single instance %u mapid %u", SingleInstanceMaps[j]->InstanceId, SingleInstanceMaps[j]->MapId);
++						delete SingleInstanceMaps[j];
++						SingleInstanceMaps[j] = NULL;
++					}
++				}
++				for(uint32 j = 1; j <= m_maxInstanceId; ++j)
++				{
++					if ((Instances[j] != NULL) && (Instances[j]->Server == WorkerServers[i])) {
++						Log.Debug("ClusterMgr", "Removing instance %u mapid %u", Instances[j]->InstanceId, Instances[j]->MapId);
++						delete Instances[j];
++						Instances.erase(j);
++					}
++				}
++				delete WorkerServers[i];
++				WorkerServers[i] = NULL;				
++			} else 
++				WorkerServers[i]->Update();
+ }
+ 
+ void ClusterMgr::DistributePacketToAll(WorldPacket * data, WServer * exclude)
+@@ -179,3 +265,10 @@
+ 		if(WorkerServers[i] && WorkerServers[i] != exclude)
+ 			WorkerServers[i]->SendPacket(data);
+ }
++
++void ClusterMgr::DistributeWOWPacketToAll(Session* from, WorldPacket * data, WServer * exclude)
++{
++	for(uint32 i = 0; i <= m_maxWorkerServer; ++i)
++		if(WorkerServers[i] && WorkerServers[i] != exclude && WorkerServers[i]->GetSocket())
++			WorkerServers[i]->GetSocket()->SendWoWPacket(from, data);
++}
+Index: ChatHandler.cpp
+===================================================================
+--- ChatHandler.cpp	(revision 0)
++++ ChatHandler.cpp	(working copy)
+@@ -0,0 +1,162 @@
++#include "RStdAfx.h"
++
++void Session::HandleChatMessage(WorldPacket & recv_data)
++{
++	CHECK_PACKET_SIZE(recv_data, 9);
++	WorldPacket *data;
++	if(!GetServer())
++		return;
++	
++	WServer* srcSrv = GetServer();
++
++	uint32 type;
++	int32 lang;
++
++	const char * pMisc = 0;
++	const char * pMsg = 0;
++	recv_data >> type;
++	recv_data >> lang;
++
++	if( lang >= NUM_LANGUAGES )
++		return;
++
++	std::string msg;
++	msg.reserve(256);
++
++	//arghhh STFU. I'm not giving you gold or items NOOB
++	switch(type)
++	{
++	case CHAT_MSG_EMOTE:
++	case CHAT_MSG_SAY:
++	case CHAT_MSG_YELL:
++	case CHAT_MSG_WHISPER:
++	case CHAT_MSG_CHANNEL:
++		{
++			if( m_muted && m_muted >= (uint32)UNIXTIME )
++			{
++				SystemMessage("Your voice is currently muted by a moderator.");
++				return;
++			}
++		}break;
++	}
++
++	switch(type)
++	{
++	case CHAT_MSG_EMOTE:
++	case CHAT_MSG_SAY:
++	case CHAT_MSG_YELL:
++	case CHAT_MSG_AFK:
++	case CHAT_MSG_DND:
++	case CHAT_MSG_RAID:
++	case CHAT_MSG_RAID_LEADER:
++	case CHAT_MSG_RAID_WARNING:
++	case CHAT_MSG_CHANNEL:
++		{
++			std::string channel = "";
++			recv_data >> channel >> msg;
++
++			data = new WorldPacket(ISMSG_CHAT, 600);
++
++			*data << type << GetPlayer()->Guid << lang << channel << msg;
++			sClusterMgr.DistributePacketToAll(data, srcSrv);
++
++			//megai2: passthrough
++			recv_data.rpos(0);
++			GetServer()->SendWoWPacket(this, &recv_data);
++		}break;
++	case CHAT_MSG_PARTY:
++		{
++			if (!GetPlayer() || !GetPlayer()->m_Group)
++				return;
++
++			//megai2: никаких проверок, ибо нафиг не надо
++			recv_data >> msg;
++
++			WorldPacket *data = new WorldPacket(SMSG_MESSAGECHAT, msg.length() + 30);
++	
++			*data << (uint8)CHAT_MSG_PARTY;
++			*data << lang;
++
++			*data << uint64(GetPlayer()->Guid);
++			*data << uint32(0);
++
++			*data << uint64(GetPlayer()->Guid);
++	
++			*data << msg.length() + 1;
++			*data << msg;
++
++			*data << uint8(GetPlayer()->bGMTag ? 4 : 0);
++
++			for(int32 i = 0; i < 1 + 7 * GetPlayer()->m_Group->groupType; ++i)
++				for(uint32 j = 0; j < 5; ++j)
++				{
++					if (GetPlayer()->m_Group->members[i][j] && sClientMgr.GetRPlayer(GetPlayer()->m_Group->members[i][j])
++						&& sClientMgr.GetSession(sClientMgr.GetRPlayer(GetPlayer()->m_Group->members[i][j])->Sessid))
++						sClientMgr.GetSession(sClientMgr.GetRPlayer(GetPlayer()->m_Group->members[i][j])->Sessid)->SendPacket(data);
++				}
++		}
++	case CHAT_MSG_OFFICER:
++	case CHAT_MSG_GUILD:
++		{
++			recv_data >> msg;
++			
++			if ((!GetPlayer()->GuildId) && !(GetPlayer()->hasGMCommand('c')))
++			{
++				//megai2: not in guild or dont have permissions
++				break;
++			}
++			
++			//megai2: посылаем запрос
++			data = new WorldPacket(ISMSG_CHAT, 600);
++			
++			*data  << type << GetSessionId() << GetPlayer()->Guid << msg << lang;
++			sClusterMgr.DistributePacketToAll(data, srcSrv);
++				
++			delete data;
++			
++			//megai2: passthrough
++			recv_data.rpos(0);
++			GetServer()->SendWoWPacket(this, &recv_data);		
++		}break;		
++	case CHAT_MSG_WHISPER:
++		{
++			std::string to = "",tmp;
++			recv_data >> to >> msg;
++
++			if(sConfig.interfaction_chat && lang > 0)
++				lang=0;
++		 
++			RPlayerInfo* player = sClientMgr.GetRPlayerByName(to.c_str());
++			WServer* dstServer;
++			
++			//megai2: без сервера ничего не посылаем
++			if(!player || !sClientMgr.GetSession(player->Sessid)->GetServer())
++			{
++				data = new WorldPacket(SMSG_CHAT_PLAYER_NOT_FOUND, to.length() + 1);
++				*data << to;
++				SendPacket(data);
++				delete data;
++				break;
++			} else 
++				dstServer = sClientMgr.GetSession(player->Sessid)->GetServer();
++			
++			if (srcSrv != dstServer)
++			{			
++				//megai2: посылаем запрос
++				data = new WorldPacket(ISMSG_CHAT, 600);
++			
++				*data  << type << player->Sessid << lang << GetPlayer()->Guid << msg;
++				dstServer->SendPacket(data);
++				
++				delete data;
++				break;
++			} else {
++				//megai2: passthrough
++				recv_data.rpos(0);
++				GetServer()->SendWoWPacket(this, &recv_data);				
++			}		
++		}break;
++	default:
++		sLog.outError("CHAT: unknown msg type %u, lang: %u", type, lang);
++	}
++}
+\ No newline at end of file
+Index: ClientManager.h
+===================================================================
+--- ClientManager.h	(revision 824)
++++ ClientManager.h	(working copy)
+@@ -23,48 +23,124 @@
+ {
+ public:
+ 	typedef HM_NAMESPACE::hash_map<uint32, RPlayerInfo*> ClientMap;
++	typedef HM_NAMESPACE::hash_map<uint32, Group*> GroupMap;
++	typedef HM_NAMESPACE::hash_map<uint32, std::string> NameMap;
+ 
+ protected:
+ 	ClientMap m_clients;
++	GroupMap m_groups;
+ 	uint32 m_maxSessionId;
+ 	Session * m_sessions[MAX_SESSIONS];
++	FastQueue<Session*, Mutex> m_SessInsertQueue;
+ 
+ public:
+ 	ClientMgr();
+ 	~ClientMgr();
++
+ 	
+-	/* create rplayerinfo struct */
++	//megai2: RPlayer
++	uint32 peakOnline;
++
+ 	RPlayerInfo * CreateRPlayer(uint32 guid);
+-
+-	/* destroy rplayerinfo struct */
+ 	void DestroyRPlayerInfo(uint32 guid);
+ 
+-	/* removes session */
+-	void RemoveSession(uint32 id);
++	void SendPackedClientInfo(WServer * server);
++	void SendPlayerUpdate(uint32 guid, WServer * server = NULL);
+ 
++	ARCEMU_INLINE int32 GetPlayersCount()
++	{
++		return m_clients.size();
++	}
+ 
+-	/* get rplayer */
++	NameMap m_plNames;
++	NameMap m_guildNames;
++
++	void LoadPlayerNames();
++	void LoadGuildNames();
++
++	ARCEMU_INLINE std::string GetGuildName(uint32 guid)
++	{
++		NameMap::iterator itr = m_guildNames.find(guid);
++		if (itr != m_guildNames.end())
++			return itr->second;
++		else
++			return "guild";//megai2: failsafe
++	}
++	
++	ARCEMU_INLINE std::string GetPlayerName(uint32 guid)
++	{
++		NameMap::iterator itr = m_plNames.find(guid);
++		if (itr != m_plNames.end())
++			return itr->second;
++		else
++			return "name_not_found_xxx";//megai2: нижние подчеркивания + тройная буква, создать такую жесть не смогут вроде  =)
++	}
++
++	ARCEMU_INLINE uint32 GetPlayerGuid(std::string name)
++	{
++		for (NameMap::iterator itr = m_plNames.begin(); itr != m_plNames.end(); ++itr)
++		{
++			if (itr->second == name)
++				return itr->first;
++		}
++		return 0;
++	}
++
++
+ 	ARCEMU_INLINE RPlayerInfo * GetRPlayer(uint32 guid)
+ 	{
+ 		ClientMap::iterator itr = m_clients.find(guid);
+ 		return (itr != m_clients.end()) ? itr->second : 0;
+ 	}
+-	/* send "mini" client data to all servers */
+-	void SendPackedClientInfo(WServer * server);
+ 
+-	/* get session by id */
+-	ARCEMU_INLINE Session * GetSession(uint32 Id) { return (Id < MAX_SESSIONS) ? m_sessions[Id] : 0; }
++	ARCEMU_INLINE RPlayerInfo * GetRPlayerByName(const char* name)
++	{
++		ClientMap::iterator itr;
++		if (m_clients.empty())
++			return NULL;
++		for (itr = m_clients.begin(); itr != m_clients.end(); ++itr)
++		{
++			if(!strcmp(itr->second->Name.c_str(), name))
++				return itr->second;
++		}
++		return NULL;
++	}
+ 
+-	/* create a new session, returns null if the player is already logged in */
+-	Session * CreateSession(uint32 AccountId);
++	//megai2: sessions
++	ARCEMU_INLINE Session * GetSessionByAcc(uint32 acct)
++	{
++		for (uint32 i = 1; i <= m_maxSessionId; ++i)
++		{
++			if (m_sessions[i] && m_sessions[i]->GetAccountId() == acct)
++				return m_sessions[i];
++		}		
++		return NULL;
++	}
+ 
+-	ARCEMU_INLINE int32 GetPlayersCount()
++	ARCEMU_INLINE uint32 GetSessionsCount()
+ 	{
+-		return m_clients.size();
++		return m_maxSessionId;
+ 	}
+ 
+-	/* updates sessions */
+-	void Update();
++	ARCEMU_INLINE Session * GetSession(uint32 Id) // get session by id 
++	{
++		return (Id < MAX_SESSIONS) ? m_sessions[Id] : 0; 
++	}
++
++	Session * CreateSession(uint32 AccountId);// create a new session, returns null if the player is already logged in 
++	void InsertSession(Session* sess);//megai2: добавляет сессию в массив при апдейте
++	void RemoveSession(uint32 id);// removes session 
++	void Update();// updates sessions 
++
++	uint32 bCharCreate;//megai2: создаеться ли уже чар? =)
++
++	//megai2: Group
++
++	void DeleteGroup(uint32 guid);
++	void LoadGroups();
++	Group* CreateGroup();
++	void SaveGroups();
++	Group* GetGroupForGuid(uint32 guid);
+ };
+ 
+ #define sClientMgr ClientMgr::getSingleton()
+Index: Session.cpp
+===================================================================
+--- Session.cpp	(revision 824)
++++ Session.cpp	(working copy)
+@@ -23,28 +23,94 @@
+ void Session::InitHandlers()
+ {
+ 	memset(Handlers, 0, sizeof(void*) * NUM_MSG_TYPES);
+-	Handlers[CMSG_PLAYER_LOGIN] = &Session::HandlePlayerLogin;
+-	Handlers[CMSG_CHAR_ENUM] = &Session::HandleCharacterEnum;
+-	Handlers[CMSG_ITEM_QUERY_SINGLE] = &Session::HandleItemQuerySingleOpcode;
++	Handlers[CMSG_PLAYER_LOGIN]		= &Session::HandlePlayerLogin;
++	Handlers[CMSG_CHAR_ENUM]		= &Session::HandleCharacterEnum;
++	//Handlers[CMSG_ITEM_QUERY_SINGLE]= &Session::HandleItemQuerySingleOpcode;
+ 	Handlers[CMSG_PING] = &Session::HandlePing;
+-}
++	Handlers[CMSG_CHAR_CREATE] = &Session::HandleCharacterCreate;
++	Handlers[CMSG_CHAR_DELETE] = &Session::HandleCharacterDelete;
+ 
+-Session::Session(uint32 id) : m_sessionId(id)
+-{
+-	m_socket = 0;
+-	m_server = 0;
+-	m_accountId = 0;
+-	m_currentPlayer = 0;
+-	m_latency = 0;
+-	m_accountFlags = 0;
+-	m_build = 0;
+-	m_nextServer = 0;
+-	latency = 0;
++	Handlers[CMSG_WHO]				= &Session::HandleWhoOpcode; 
++	Handlers[CMSG_MESSAGECHAT]      = &Session::HandleChatMessage;
++
++	// Groups / Raids
++	Handlers[CMSG_GROUP_INVITE]							  = &Session::HandleGroupInviteOpcode;
++	Handlers[CMSG_GROUP_CANCEL]							  = &Session::HandleGroupCancelOpcode;
++	Handlers[CMSG_GROUP_ACCEPT]							  = &Session::HandleGroupAcceptOpcode;
++	Handlers[CMSG_GROUP_DECLINE]							 = &Session::HandleGroupDeclineOpcode;
++	Handlers[CMSG_GROUP_UNINVITE]							= &Session::HandleGroupUninviteOpcode;
++	Handlers[CMSG_GROUP_UNINVITE_GUID]					   = &Session::HandleGroupUninviteGuildOpcode;
++	Handlers[CMSG_GROUP_SET_LEADER]						  = &Session::HandleGroupSetLeaderOpcode;
++	Handlers[CMSG_GROUP_DISBAND]							 = &Session::HandleGroupDisbandOpcode;
++	Handlers[CMSG_LOOT_METHOD]							   = &Session::HandleLootMethodOpcode;
++	Handlers[MSG_MINIMAP_PING]							   = &Session::HandleMinimapPingOpcode;
++	Handlers[CMSG_GROUP_RAID_CONVERT]						= &Session::HandleConvertGroupToRaidOpcode;
++	Handlers[CMSG_GROUP_CHANGE_SUB_GROUP]					= &Session::HandleGroupChangeSubGroup;
++	Handlers[CMSG_GROUP_ASSISTANT_LEADER]					= &Session::HandleGroupAssistantLeader;
++	Handlers[CMSG_REQUEST_RAID_INFO]						 = &Session::HandleRequestRaidInfoOpcode;
++	Handlers[MSG_RAID_READY_CHECK]						   = &Session::HandleReadyCheckOpcode;
++	Handlers[CMSG_REQUEST_PARTY_MEMBER_STATS]				= &Session::HandlePartyMemberStatsOpcode;
++	Handlers[MSG_SET_DUNGEON_DIFFICULTY]					 =	&Session::HandleDungeonDifficultyOpcode;
++	//megai2: removed? о_О
++	//Handlers[MSG_GROUP_SET_PLAYER_ICON]					  = &Session::HandleSetPlayerIconOpcode;
++	//Handlers[CMSG_GROUP_PROMOTE]								= &Session::HandleGroupPromote;
++
++	// Battlegrounds
++	Handlers[CMSG_BATTLEFIELD_PORT]						= &Session::HandleBgOps;
++	Handlers[CMSG_BATTLEFIELD_STATUS]					= &Session::HandleBgOps;
++	Handlers[CMSG_BATTLEMASTER_JOIN_ARENA]				= &Session::HandleBgOps;
++	Handlers[CMSG_BATTLEMASTER_JOIN]					= &Session::HandleBgOps;
++
++/* 7z - надо перенести
++	// Френды покачто в мире 
++	WorldPacketHandlers[CMSG_FRIEND_LIST].handler							   = &Session::HandleFriendListOpcode;
++	WorldPacketHandlers[CMSG_ADD_FRIEND].handler								= &Session::HandleAddFriendOpcode;
++	WorldPacketHandlers[CMSG_DEL_FRIEND].handler								= &Session::HandleDelFriendOpcode;
++	WorldPacketHandlers[CMSG_ADD_IGNORE].handler								= &Session::HandleAddIgnoreOpcode;
++	WorldPacketHandlers[CMSG_DEL_IGNORE].handler								= &Session::HandleDelIgnoreOpcode;
++	WorldPacketHandlers[CMSG_BUG].handler									   = &Session::HandleBugOpcode;
++	WorldPacketHandlers[CMSG_SET_FRIEND_NOTE].handler							= &Session::HandleSetFriendNote;
++
++	// LFG System
++	WorldPacketHandlers[CMSG_SET_LOOKING_FOR_GROUP_COMMENT].handler				= &Session::HandleSetLookingForGroupComment;
++	WorldPacketHandlers[MSG_LOOKING_FOR_GROUP].handler							= &Session::HandleMsgLookingForGroup;
++	WorldPacketHandlers[CMSG_SET_LOOKING_FOR_GROUP].handler						= &Session::HandleSetLookingForGroup;
++	WorldPacketHandlers[CMSG_SET_LOOKING_FOR_MORE].handler						= &Session::HandleSetLookingForMore;
++	WorldPacketHandlers[CMSG_ENABLE_AUTOJOIN].handler							= &Session::HandleEnableAutoJoin;
++	WorldPacketHandlers[CMSG_DISABLE_AUTOJOIN].handler							= &Session::HandleDisableAutoJoin;
++	WorldPacketHandlers[CMSG_ENABLE_AUTOADD_MEMBERS].handler					= &Session::HandleEnableAutoAddMembers;
++	WorldPacketHandlers[CMSG_DISABLE_AUTOADD_MEMBERS].handler					= &Session::HandleDisableAutoAddMembers;
++	WorldPacketHandlers[CMSG_CLEAR_LOOKING_FOR_GROUP_STATE].handler				= &Session::HandleLfgClear;
++
++*/
+ }
+ 
+-Session::~Session()
++
++void Session::SystemMessage(const char * format, ...)
+ {
++	char buffer[1024];
++	va_list ap;
++	va_start(ap,format);
++	vsnprintf(buffer,1024,format,ap);
++	va_end(ap);
+ 
++	uint32 messageLength = (uint32)strlen((char*)buffer) + 1;
++
++	WorldPacket * data = new WorldPacket(SMSG_MESSAGECHAT, 30 + messageLength);
++	*data << (uint8)CHAT_MSG_SYSTEM;
++	*data << (uint32)LANG_UNIVERSAL;
++	
++	*data << (uint64)0; // Who cares about guid when there's no nickname displayed heh ?
++	*data << (uint32)0;
++	*data << (uint64)0;
++
++	*data << messageLength;
++	*data << buffer;
++
++	*data << uint8(0);
++
++	SendPacket(data);
++	delete data;
+ }
+ 
+ void Session::HandlePing(WorldPacket & pck)
+@@ -63,35 +129,89 @@
+ 
+ 	pck >> ping;
+ 	pck >> latency;
++
++	//megai2: походу клиент рандомит гдето что-то =)
++	//lastPing = ping;
++
++/*	if (lastPing == 0)
++		lastPing = ping;
++	else if (lastPing + 1 != ping)//megai2: don't allow us process so broken connection =)
++		m_socket->Disconnect();
++	else 
++		++lastPing;*/
++	lastPingTime = (uint32)UNIXTIME;
++
+ 	WorldPacket pongPck = WorldPacket(SMSG_PONG, 4);
+ 	pongPck << ping;
+ 	SendPacket(&pongPck);
+ }
+ 
++Session::Session(uint32 id) : m_sessionId(id)
++{
++	m_socket = 0;
++	m_server = 0;
++	m_accountId = 0;
++	m_currentPlayer = 0;
++	m_latency = 0;
++	m_accountFlags = 0;
++	m_build = 0;
++	m_nextServer = 0;
++	m_oldServer = 0;
++	latency = 0;
++	m_deleted = false;
++	m_muted = 0;
++	lastPing = 1;
++	lastPingTime = (uint32)UNIXTIME;
++	pendingIID = 0;
++	pendingSID = 0;
++	teleportRq = NULL;
++	has_dk = false;
++	has_55_lvl = false;
++	actQu = false;
++}
++
++Session::~Session()
++{
++	WorldPacket * pck;
++	while((pck = m_readQueue[!actQu].Pop()) != 0)
++		delete pck;
++	while((pck = m_readQueue[actQu].Pop()) != 0)
++		delete pck;
++}
++
+ void Session::Update()
+ {
+-	if (latency > 5000 && m_socket && m_socket->IsConnected())
++	if ((UNIXTIME - lastPingTime > WORLDSOCKET_TIMEOUT && lastPing) && m_socket && m_socket->IsConnected())
+ 	{
+ 		m_socket->Disconnect();
+ 		return;
+ 	}
+ 	WorldPacket * pck;
+ 	uint16 opcode;
+-	while((pck = m_readQueue.Pop()))
++	//megai2: игрок логиниться, дабы не потерять пакеты, ждем когда на сервере он прогрузиться
++	if (GetNextServer() && GetPlayer())
++		return;
++	while((pck = m_readQueue[actQu].Pop()))
+ 	{
+ 		opcode = pck->GetOpcode();
+ 
+-		/* can we handle it ourselves? */
+-		if(Session::Handlers[opcode] != 0)
++		if (Session::Handlers[opcode] == 0)
+ 		{
++ 			//megai2: сохранять - опасно, и пропускать тоже. выбираем меньшее из 2 зол )
++			if (GetServer())
++				GetServer()->SendWoWPacket(this, pck);
++			delete pck;
++		} else {
++			/* can we handle it ourselves? */
+ 			(this->*Session::Handlers[opcode])(*pck);
++			//megai2: мы создаем чара или грузим чара, не обрабатываем ничерта пока это делаем!
++			if (sClientMgr.bCharCreate || GetNextServer())
++			{
++				delete pck;
++				return;
++			}
++			delete pck; 
+ 		}
+-		else
+-		{
+-			/* no? pass it back to the worker server for handling. */
+-			if(m_server)
+-				m_server->SendWoWPacket(this, pck);
+-		}
+-		delete pck;
+ 	}
++	actQu = !actQu;
+ }
+Index: BattlegroundHandler.cpp
+===================================================================
+--- BattlegroundHandler.cpp	(revision 0)
++++ BattlegroundHandler.cpp	(working copy)
+@@ -0,0 +1,37 @@
++/*
++ * ArcEmu MMORPG Server
++ * Copyright (C) 2005-2007 Ascent Team <http://www.ascentemu.com/>
++ * Copyright (C) 2008 <http://www.ArcEmu.org/>
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU Affero General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Affero General Public License for more details.
++ *
++ * You should have received a copy of the GNU Affero General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ *
++ */
++
++#include "RStdAfx.h"
++
++void Session::HandleBgOps(WorldPacket &recv_data)
++{
++	//megai2: do it simple... =)
++	if (!GetPlayer())
++		return;
++
++	if (!GetPlayer()->onBg)
++	{
++		SystemMessage("You must be in battle room to use battleground system");
++		return;
++	}
++
++	if (GetServer())
++		GetServer()->SendWoWPacket(this, &recv_data);
++}
+\ No newline at end of file
+Index: GroupHandler.cpp
+===================================================================
+--- GroupHandler.cpp	(revision 0)
++++ GroupHandler.cpp	(working copy)
+@@ -0,0 +1,1219 @@
++#include "RStdAfx.h"
++
++void ClientMgr::DeleteGroup(uint32 guid)
++{
++	if (m_groups.find(guid) == m_groups.end())
++		return;
++
++	Group* g = m_groups[guid];
++
++	for(uint32 i = 0; i < 8; ++i)
++		for(uint32 j = 0; j < 5; ++j)
++			if (g->members[i][j] && sClientMgr.GetRPlayer(g->members[i][j]))
++			{
++				Session * sess = sClientMgr.GetSession(sClientMgr.GetRPlayer(g->members[i][j])->Sessid);
++
++				uint8 buffer[24];
++				memset(buffer, 0, 24);
++				sess->OutPacket( SMSG_GROUP_LIST, 24, buffer );
++
++				WorldPacket data(50);
++
++				data.SetOpcode( SMSG_GROUP_DESTROYED );
++				sess->SendPacket( &data );
++	
++				data.Initialize( SMSG_PARTY_COMMAND_RESULT );
++				data << uint32(2) << uint8(0) << uint32(0);  // you leave the group
++				sess->SendPacket( &data );
++			}
++
++	m_groups.erase(m_groups.find(guid));
++	delete g;
++}
++
++Group* ClientMgr::GetGroupForGuid(uint32 guid)
++{
++	for (GroupMap::iterator itr = m_groups.begin(); itr != m_groups.end(); ++itr)
++	{
++		Group* g = itr->second;
++
++		for(uint32 i = 0; i < 8; ++i)
++			for(uint32 j = 0; j < 5; ++j)
++				if(g->members[i][j] == guid)
++					return g;
++	}
++	return NULL;
++}
++
++void ClientMgr::LoadGroups()
++{
++	QueryResult * result = CharacterDatabase.Query("SELECT * FROM groups WHERE group_id < 2147483647");
++	if(result)
++	{
++		if(result->GetFieldCount() != 51)
++		{
++			Log.LargeErrorMessage(LARGERRORMESSAGE_WARNING, "groups table format is invalid. Please update your database.");
++			return;
++		}
++		do 
++		{
++			Field * fields = result->Fetch();
++			Group * g = new Group;
++			g->groupId = fields[0].GetUInt32();
++
++			g->groupType = fields[1].GetUInt8();
++			g->subCnt = fields[2].GetUInt8();
++			g->lootMeth = fields[3].GetUInt8();
++			g->lootThres = fields[4].GetUInt8();
++			g->difficulty = fields[5].GetUInt8();
++			g->leader = fields[6].GetUInt32();
++			g->mTank = fields[7].GetUInt32();
++			g->mAssist = fields[8].GetUInt32();
++
++			// assign players into groups
++
++			//megai2: null
++			for(int i = 0; i < 8; ++i)
++			{
++				g->targetIcons[i] = 0;
++				for(int j = 0; j < 5; ++j)
++					g->members[i][j] = 0;
++			}
++
++			for(int i=0; i<NUM_MAPS; i++)
++			{	
++				for(int j=0; j<NUM_INSTANCE_MODES; j++)
++				{
++					g->instanceIds[i][j] = 0;
++				}
++			}
++
++			for(int i = 0; i < g->subCnt; ++i)
++			{
++				for(int j = 0; j < 5; ++j)
++				{
++					uint32 guid = fields[9 + (i*5) + j].GetUInt32();
++					if( guid == 0 )
++						continue;
++					
++					g->members[i][j] = guid;
++				}
++			}
++		
++			char *ids = strdup(fields[50].GetString());
++					char *q = ids;
++			char *p = strchr(q, ' ');
++			while(p)
++			{
++				char *r = strchr(q, ':');
++				if(r == NULL || r > p)
++					continue;
++				*p = 0;
++				*r = 0;
++				char *s = strchr(r+1, ':');
++				if(s == NULL || s > p)
++					continue;
++				*s = 0;
++				uint32 mapId = atoi(q);
++				uint32 mode = atoi(r+1);
++				uint32 instanceId = atoi(s+1);
++		
++				if(mapId >= NUM_MAPS)
++					continue;
++
++				g->instanceIds[mapId][mode] = instanceId;
++	
++				q = p+1;
++				p = strchr(q, ' ');
++			}
++			free(ids);
++			
++			m_groups[g->groupId] = g;
++
++			g = NULL;	
++		} while(result->NextRow());
++		Log.Notice("ObjectMgr", "%u groups loaded.", result->GetRowCount());
++		delete result;
++	}
++}
++
++void ClientMgr::SaveGroups()
++{	
++	//megai2: saveall
++
++	if (m_groups.empty())
++		return;
++
++	for (GroupMap::iterator itr = m_groups.begin(); itr != m_groups.end(); ++itr)
++	{
++		std::stringstream ss;
++
++		ss.str("");
++
++		Group* g = itr->second;
++
++	/*	if(!m_disbandOnNoMembers)	// don't save bg groups 
++			return;*/
++
++		ss << "REPLACE INTO groups VALUES("
++			<< g->groupId << ","
++			<< uint32(g->groupType) << ","
++			<< uint32(g->subCnt) << ","
++			<< uint32(g->lootMeth) << ","
++			<< uint32(g->lootThres) << ","
++			<< uint32(g->difficulty) << ","
++			<< g->leader << "," 
++			<< g->mTank << ","
++			<< g->mAssist << ",";
++	
++		for(uint32 i = 0; i < 8; ++i)
++			for(uint32 j = 0; j < 5; ++j)
++			{
++				ss << g->members[i][j] << ",";
++			}
++	
++	
++		ss << (uint32)UNIXTIME << ",'";
++		for(int i=0; i<NUM_MAPS; i++)
++		{
++			for(int j=0; j<NUM_INSTANCE_MODES; j++)
++			{
++				if(g->instanceIds[i][j] > 0)
++				{
++					ss << i << ":" << j << ":" << g->instanceIds << " ";
++				}
++			}
++		}
++		ss << "')";
++		/*printf("==%s==\n", ss.str().c_str());*/
++
++		CharacterDatabase.Query(ss.str().c_str());
++	}
++}
++Group * ClientMgr::CreateGroup()
++{
++	++sGuidInfo.m_hiGroupGuid;
++
++	Group * g = new Group;
++	g->groupId = sGuidInfo.m_hiGroupGuid;
++
++	g->groupType = GROUP_TYPE_PARTY;
++	g->subCnt = 1;
++	g->lootMeth = PARTY_LOOT_GROUP;
++	g->lootThres = 2;
++	g->difficulty = g->leader = g->mTank = g->mAssist = 0;
++
++	//megai2: null
++	for(int i = 0; i < 8; ++i)
++	{
++		g->targetIcons[i] = 0;
++		for(int j = 0; j < 5; ++j)
++			g->members[i][j] = 0;
++	}
++
++	for(int i = 0; i < NUM_MAPS; ++i)
++		for(int j = 0; j < NUM_INSTANCE_MODES; ++j)
++			g->instanceIds[i][j] = 0;
++			
++	m_groups[g->groupId] = g;
++
++	return g;
++}
++
++void Session::GroupUpdate()
++{
++	Group* g = NULL;
++	if (GetPlayer() && GetPlayer()->m_Group)
++		g = GetPlayer()->m_Group;
++	else
++		return;
++
++	WorldPacket data(SMSG_GROUP_LIST, 50 + ( 40 * 20 ));
++
++	uint32 MemberCount = 0;
++
++	for(int32 i = 0; i < 1 + 7 * g->groupType; ++i)
++		for(uint32 j = 0; j < 5; ++j)
++			if (g->members[i][j])
++				++MemberCount;
++
++
++
++	for(int32 i = 0; i < 1 + 7 * g->groupType; ++i)
++		for(uint32 j = 0; j < 5; ++j)
++		{
++			if (g->members[i][j] == 0)
++				continue;
++
++			if (!sClientMgr.GetRPlayer(g->members[i][j]))
++				continue;
++
++			RPlayerInfo* plr = sClientMgr.GetRPlayer(g->members[i][j]);
++
++			if (plr->onBg)
++				continue;
++
++			if (plr->LootInfo = -1 || plr->LootInfo != (g->lootThres << 16 | g->lootMeth))
++				plr->LootInfo = g->lootThres << 16 | g->lootMeth;
++
++			data.Initialize(SMSG_GROUP_LIST);
++			data << uint8(g->groupType);	//0=party,1=raid
++			data << uint8(0);   // unk
++			data << uint8(i+1);
++			data << uint8(0);	// unk2
++			//data << uint64(0);	// unk3
++			data << uint64(0x500000000004BC0CULL);
++			data << uint32(MemberCount-1);	// we don't include self
++
++			for(int32 k = 0; k < 1 + 7 * g->groupType; ++k)
++				for(uint32 l = 0; l < 5; ++l)
++				{
++					if( g->members[i][j] == g->members[k][l])
++						continue;
++
++					// should never happen but just in case
++					if(g->members[k][l] == 0)
++						continue;
++
++					data << sClientMgr.GetPlayerName(g->members[k][l]).c_str() << g->members[k][l] << uint32(0);	// highguid
++							
++					if( sClientMgr.GetRPlayer(g->members[k][l]) )
++						data << uint8( 1 );
++					else
++						data << uint8( 0 );
++
++					data << uint8( k + 1 );
++						
++					uint8 flags = 0;
++
++					if( g->members[k][l] == g->leader )
++						flags |= 1;
++					if( g->members[k][l] == g->mTank )
++						flags |= 2;
++					if( g->members[k][l] == g->mAssist )
++						flags |= 4;
++
++					data << flags;
++				}
++
++
++			data << uint32(g->leader) << uint32(0) << uint8( g->lootMeth);
++			data << uint64( 0 );//megai2: looter ><
++			data << uint8( g->lootThres ) << uint8( g->difficulty );
++
++			Session * Sess = sClientMgr.GetSession(plr->Sessid);
++			Sess->SendPacket(&data);
++
++			//megai2: походу я перебрал %)
++			data.Initialize(ISMSG_PARTY_UPDATE);
++			data << uint8(PUT_SELF_TO_OTHER);
++			data << g->members[i][j];
++
++			for(int32 k = 0; k < 1 + 7 * g->groupType; ++k)
++				for(uint32 l = 0; l < 5; ++l)
++				{
++					if (g->members[k][l] && sClientMgr.GetRPlayer(g->members[k][l]))
++						data << sClientMgr.GetRPlayer(g->members[k][l])->Sessid;
++				}
++			data << uint32(0);
++				
++			if (Sess->GetServer())
++			{
++				Sess->GetServer()->SendPacket(&data);
++				sClientMgr.SendPlayerUpdate(plr->Guid);
++			}
++		}
++}
++
++#define BG_CHECK if (_player->onBg)  { if (GetServer()) GetServer()->SendWoWPacket(this, &pck); return;	}
++
++void Session::HandleGroupInviteOpcode(WorldPacket & pck)
++{
++	RPlayerInfo * _player = NULL; 
++	if (!GetPlayer())
++		return;
++	else
++		_player = GetPlayer();
++
++	BG_CHECK
++
++	CHECK_PACKET_SIZE(pck, 1);
++	WorldPacket data(100);
++	std::string membername;
++	RPlayerInfo * player = NULL;
++	Group *group = NULL;
++
++	pck >> membername;
++	if(GetPlayer()->inviter)
++		return;
++
++	player = sClientMgr.GetRPlayerByName(membername.c_str());
++
++	if ( player == NULL)
++	{
++		SendPartyCommandResult(_player, 0, membername, ERR_PARTY_CANNOT_FIND);
++		return;
++	}
++
++	if (player == _player)
++	{
++		return;
++	}
++
++	if (player->onBg)
++	{
++		SendPartyCommandResult(_player, 0, membername, ERR_PARTY_ALREADY_IN_GROUP);
++		return;
++	}
++
++	if (_player->m_Group && _player->m_Group->leader != _player->Guid)
++	{
++		SendPartyCommandResult(_player, 0, "", ERR_PARTY_YOU_ARE_NOT_LEADER);
++		return;
++	}
++
++	group = _player->m_Group;
++	if ( group != NULL )
++	{
++		if (group->IsFull())
++		{
++			SendPartyCommandResult(_player, 0, "", ERR_PARTY_IS_FULL);
++			return;
++		}
++	}
++	
++	if ( player->m_Group )
++	{
++		SendPartyCommandResult(_player, player->m_Group->groupType, membername, ERR_PARTY_ALREADY_IN_GROUP);
++		data.SetOpcode(SMSG_GROUP_INVITE);
++		data << uint8(0);
++		data << GetPlayer()->Name.c_str();
++		sClientMgr.GetSession(player->Sessid)->SendPacket(&data);
++		return;
++	}
++	
++	if(player->GetTeam()!=_player->GetTeam() && _player->GMPermissions.length() == 0 && !sConfig.interfaction_group)
++	{
++		SendPartyCommandResult(_player, 0, membername, ERR_PARTY_WRONG_FACTION);
++		return;
++	}
++
++	if ( player->inviter )
++	{
++		SendPartyCommandResult(_player, 0, membername, ERR_PARTY_ALREADY_IN_GROUP);
++		return;
++	}
++
++	/*if( player->Social_IsIgnoring( _player->GetLowGUID() ) )
++	{
++		SendPartyCommandResult(_player, 0, membername, ERR_PARTY_IS_IGNORING_YOU);
++		return;
++	}*/
++	
++	if(player->bGMTag)
++	{
++		SendPartyCommandResult(_player, 0, membername, ERR_PARTY_CANNOT_FIND);
++		return;
++	}
++	
++	data.SetOpcode(SMSG_GROUP_INVITE);
++	data << uint8(1);
++	data << GetPlayer()->Name.c_str();
++
++	sClientMgr.GetSession(player->Sessid)->SendPacket(&data);
++
++	uint32 gtype = 0;
++	if(group)
++		gtype = group->groupType;
++
++	SendPartyCommandResult(_player, gtype, membername, ERR_PARTY_NO_ERROR);
++
++	// 16/08/06 - change to guid to prevent very unlikely event of a crash in deny, etc
++	player->inviter = _player->Guid;
++}
++
++void Session::HandleGroupCancelOpcode(WorldPacket & pck){ 
++
++} 
++
++void Session::HandleGroupAcceptOpcode(WorldPacket & pck)
++{ 
++	RPlayerInfo * _player;
++
++	if (!GetPlayer() || !GetPlayer()->inviter)
++		return;
++	else
++		_player = GetPlayer();
++
++	BG_CHECK
++
++	//if(!_player->IsInWorld()) return;
++
++	RPlayerInfo *player = sClientMgr.GetRPlayer(_player->inviter);
++	if ( !player )
++		return;
++	
++	player->inviter = 0;
++	_player->inviter = 0;
++
++	if (player->onBg)
++		return;
++	
++	Group *grp = player->m_Group;
++
++	if(grp)
++	{
++		if (grp->AddMember(_player->Guid))
++			_player->m_Group = grp;
++
++		GroupUpdate();
++
++		//_player->iInstanceType = grp->m_difficulty;
++		//_player->SendDungeonDifficulty();
++
++        //sInstanceSavingManager.ResetSavedInstancesForPlayer(_player);
++		return;
++	}
++	
++	// If we're this far, it means we have no existing group, and have to make one.
++	
++	grp = sClientMgr.CreateGroup();
++	grp->difficulty = 0/*player->iInstanceType*/;
++	grp->leader = player->Guid;
++	if (grp->AddMember(player->Guid))		// add the inviter first, therefore he is the leader
++		player->m_Group = grp;
++	if (grp->AddMember(_player->Guid))		// add us.
++		_player->m_Group = grp;	  
++
++	WorldPacket data( SMSG_GROUP_SET_LEADER, player->Name.length() + 1 );
++	data << player->Name;
++	for(int32 i = 0; i < 1 + 7 * grp->groupType; ++i)
++		for(uint32 j = 0; j < 5; ++j)
++		{	
++			if (sClientMgr.GetRPlayer(grp->members[i][j]))
++				sClientMgr.GetSession(sClientMgr.GetRPlayer(grp->members[i][j])->Sessid)->SendPacket(&data);	
++		}
++
++	GroupUpdate();
++
++	//_player->iInstanceType = grp->m_difficulty;
++	//_player->SendDungeonDifficulty();
++
++	/*Instance *instance = sInstanceMgr.GetInstanceByIds(player->GetMapId(), player->GetInstanceID());
++	if(instance != NULL && instance->m_creatorGuid == player->GetLowGUID())
++	{
++		grp->m_instanceIds[instance->m_mapId][instance->m_difficulty] = instance->m_instanceId;
++		instance->m_creatorGroup = grp->GetID();
++		instance->m_creatorGuid = 0;
++		instance->SaveToDB();
++	}*/
++
++    //sInstanceSavingManager.ResetSavedInstancesForPlayer(_player);
++
++	// Currentgroup and all that shit are set by addmember.
++} 
++
++void Session::HandleGroupDeclineOpcode(WorldPacket & pck)
++{ 
++	RPlayerInfo * _player;
++
++	if (!GetPlayer())
++		return;
++	else
++		_player = GetPlayer();
++
++	BG_CHECK
++
++	WorldPacket data(SMSG_GROUP_DECLINE, 100);
++
++	RPlayerInfo* player = sClientMgr.GetRPlayer(GetPlayer()->inviter);
++	if(!player) 
++		return;
++
++	data << GetPlayer()->Name.c_str();
++
++	sClientMgr.GetSession(player->Sessid)->SendPacket( &data );
++	player->inviter = 0;
++	GetPlayer()->inviter = 0;
++} 
++
++void Session::HandleGroupUninviteOpcode(WorldPacket & pck)
++{ 
++	RPlayerInfo * _player;
++
++	if (!GetPlayer())
++		return;
++	else
++		_player = GetPlayer();
++
++	BG_CHECK
++
++	CHECK_PACKET_SIZE(pck, 1);
++	std::string membername;
++	Group *group;
++	RPlayerInfo * player;
++
++	pck >> membername;
++
++	player = sClientMgr.GetRPlayerByName(membername.c_str());
++	if ( player == NULL && sClientMgr.GetPlayerGuid(membername) == 0)
++	{
++		SendPartyCommandResult(_player, 0, membername, ERR_PARTY_CANNOT_FIND);
++		return;
++	}
++
++	if (player && (!_player->m_Group || _player->m_Group != player->m_Group))
++	{
++		SendPartyCommandResult(_player, 0, membername, ERR_PARTY_IS_NOT_IN_YOUR_PARTY);
++		return;
++	}
++
++	if (_player->m_Group && _player->Guid != _player->m_Group->leader )
++	{
++		if (player == NULL)
++		{
++			SendPartyCommandResult(_player, 0, membername, ERR_PARTY_CANNOT_FIND);
++			return;
++		}
++		else if(_player != player)
++		{
++			SendPartyCommandResult(_player, 0, "", ERR_PARTY_YOU_ARE_NOT_LEADER);
++			return;
++		}
++	}
++
++	group = _player->m_Group;
++
++	//megai2: создаем инсту 
++	if (player && sClientMgr.GetSession(player->Sessid)->GetTeleportPendingPck() != NULL)
++	{
++		SendPartyCommandResult(_player, 0, membername, ERR_PARTY_UNK);//megai2: WOW!
++		return;
++	}
++
++	if(!group)
++		return;
++
++	if (group->RemoveMember(sClientMgr.GetPlayerGuid(membername)) && player)
++		player->m_Group = NULL;	
++
++	if (player)
++	{
++		Session * sess = sClientMgr.GetSession(player->Sessid);
++
++		uint8 buffer[24];
++		memset(buffer, 0, 24);
++		sess->OutPacket( SMSG_GROUP_LIST, 24, buffer );
++
++		WorldPacket data(50);
++
++		data.SetOpcode( SMSG_GROUP_DESTROYED );
++		sess->SendPacket( &data );
++	
++		data.Initialize( SMSG_PARTY_COMMAND_RESULT );
++		data << uint32(2) << uint8(0) << uint32(0);  // you leave the group
++		sess->SendPacket( &data );
++
++		player->m_Group = NULL;
++		player->LootInfo = -1;
++
++		sClientMgr.SendPlayerUpdate(player->Guid);
++	}
++
++	if (_player == player)
++	{
++		for(int32 i = 0; i < 1 + 7 * group->groupType; ++i)
++			for(uint32 j = 0; j < 5; ++j)
++			{	
++				if (group->members[i][j] && sClientMgr.GetRPlayer(group->members[i][j]))
++				{
++					sClientMgr.GetSession(sClientMgr.GetRPlayer(group->members[i][j])->Sessid)->GroupUpdate();
++					break;
++				}
++			}
++	} else
++		GroupUpdate();
++
++	uint32 MemberCount = 0;
++
++	for(int32 i = 0; i < 1 + 7 * group->groupType; ++i)
++		for(uint32 j = 0; j < 5; ++j)
++			if (group->members[i][j])
++				++MemberCount;
++
++	if (MemberCount <= 2)
++		HandleGroupDisbandOpcode(pck);
++} 
++void Session::HandleGroupUninviteGuildOpcode(WorldPacket & pck)
++{ 
++
++} 
++
++void Session::HandleGroupSetLeaderOpcode(WorldPacket & pck)
++{ 
++	RPlayerInfo * _player;
++
++	if (!GetPlayer())
++		return;
++	else
++		_player = GetPlayer();
++
++	BG_CHECK
++
++	CHECK_PACKET_SIZE(pck, 1);
++	WorldPacket data;
++	uint64 MemberGuid;
++	RPlayerInfo * player;
++
++	pck >> MemberGuid;
++	
++	player = sClientMgr.GetRPlayer((uint32)MemberGuid);
++
++	if ( player == NULL )
++	{
++		//SendPartyCommandResult(_player, 0, membername, ERR_PARTY_CANNOT_FIND);
++		SendPartyCommandResult(_player, 0, _player->Name, ERR_PARTY_CANNOT_FIND);
++		return;
++	}
++
++	if(_player->m_Group->leader != _player->Guid)
++	{
++		SendPartyCommandResult(_player, 0, "", ERR_PARTY_YOU_ARE_NOT_LEADER);
++		return;
++	}
++	
++	if(player->m_Group != _player->m_Group)
++	{
++		//SendPartyCommandResult(_player, 0, membername, ERR_PARTY_IS_NOT_IN_YOUR_PARTY);
++		SendPartyCommandResult(_player, 0, _player->Name, ERR_PARTY_IS_NOT_IN_YOUR_PARTY);
++		return;
++	}
++
++	Group *pGroup = _player->m_Group;
++	if(pGroup)
++	{
++		pGroup->leader = (uint32)MemberGuid;	
++		WorldPacket data( SMSG_GROUP_SET_LEADER, player->Name.length() + 1 );
++		data << player->Name;
++		for(int32 i = 0; i < 1 + 7 * pGroup->groupType; ++i)
++			for(uint32 j = 0; j < 5; ++j)
++			{	
++				if (sClientMgr.GetRPlayer(pGroup->members[i][j]))
++					sClientMgr.GetSession(sClientMgr.GetRPlayer(pGroup->members[i][j])->Sessid)->SendPacket(&data);	
++			}
++		GroupUpdate();
++	}
++} 
++
++void Session::HandleGroupDisbandOpcode(WorldPacket & pck)
++{ 
++	//megai2: походу оно работает как лив ><
++	RPlayerInfo * _player;
++
++	if (!GetPlayer())
++		return;
++	else
++		_player = GetPlayer();
++
++	BG_CHECK
++
++	Group* pGroup = _player->m_Group;
++	if(!pGroup) 
++		return;
++
++	uint32 MemberCount = 0;
++
++	for(int32 i = 0; i < 1 + 7 * pGroup->groupType; ++i)
++		for(uint32 j = 0; j < 5; ++j)
++			if (pGroup->members[i][j])
++				++MemberCount;
++
++	uint32 oldLead = pGroup->leader;
++
++	//megai2: ремувим всех кого нужно!
++	for(int32 i = 0; i < 1 + 7 * pGroup->groupType; ++i)
++		for(uint32 j = 0; j < 5; ++j)
++			if (pGroup->members[i][j] && (MemberCount <= 2 || pGroup->members[i][j] == _player->Guid))
++			{
++				RPlayerInfo * player = sClientMgr.GetRPlayer(pGroup->members[i][j]);
++				if (player)
++				{
++					Session * sess = sClientMgr.GetSession(player->Sessid);
++
++					//megai2: никуда ты не дисбанднешся, понял? -_-
++					if (sess->GetTeleportPendingPck() != NULL)
++						return;
++		
++					uint8 buffer[24];
++					memset(buffer, 0, 24);
++					sess->OutPacket( SMSG_GROUP_LIST, 24, buffer );
++
++					WorldPacket data(50);
++
++					data.SetOpcode( SMSG_GROUP_DESTROYED );
++					sess->SendPacket( &data );
++		
++					data.Initialize( SMSG_PARTY_COMMAND_RESULT );
++					data << uint32(2) << uint8(0) << uint32(0);  // you leave the group
++					sess->SendPacket( &data );
++
++					player->m_Group = NULL;
++					player->LootInfo = -1;
++
++					sClientMgr.SendPlayerUpdate(player->Guid);
++				}
++				pGroup->RemoveMember(pGroup->members[i][j]);
++			}
++
++	RPlayerInfo* lead = sClientMgr.GetRPlayer(pGroup->leader);
++	if (lead && pGroup->leader != oldLead)
++	{
++		WorldPacket data( SMSG_GROUP_SET_LEADER, lead->Name.length() + 1 );
++		data << lead->Name;
++		for(int32 i = 0; i < 1 + 7 * pGroup->groupType; ++i)
++			for(uint32 j = 0; j < 5; ++j)
++			{	
++				if (sClientMgr.GetRPlayer(pGroup->members[i][j]))
++					sClientMgr.GetSession(sClientMgr.GetRPlayer(pGroup->members[i][j])->Sessid)->SendPacket(&data);	
++			}		
++	}
++
++
++
++	if (MemberCount <= 2)
++		sClientMgr.DeleteGroup(pGroup->groupId);
++
++	_player->m_Group = NULL;
++} 
++ 
++void Session::HandleLootMethodOpcode(WorldPacket & pck)
++{ 
++	RPlayerInfo * _player;
++
++	if (!GetPlayer())
++		return;
++	else
++		_player = GetPlayer();
++
++	BG_CHECK
++
++	CHECK_PACKET_SIZE(pck, 16);
++
++	if (!_player->m_Group)
++		return;
++
++	uint32 lootMethod;
++	uint64 lootMaster;
++	uint32 threshold;
++
++	pck >> lootMethod >> lootMaster >> threshold;
++  
++	if(_player->m_Group->leader != _player->Guid)
++	{
++		SendPartyCommandResult(_player, 0, "", ERR_PARTY_YOU_ARE_NOT_LEADER);
++		return;
++	}
++	
++	Group* pGroup = _player->m_Group; 
++
++	if( pGroup == NULL)
++		return;
++
++	pGroup->lootMeth = lootMethod;
++	pGroup->looter = GetPlayer()->Guid;
++	pGroup->lootThres = threshold;
++
++	GroupUpdate();
++
++	//megai2: TODO
++
++	/*Player * pLootMaster = objmgr.GetPlayer((uint32)lootMaster);
++
++	if ( pLootMaster )
++		pGroup->SetLooter(pLootMaster , lootMethod, threshold );
++	else
++		pGroup->SetLooter(_player , lootMethod, threshold );*/
++
++  // cebernic: Extended this code,it supports diff leader & lootmaster.
++ /* Player *plr = objmgr.GetPlayer((uint32)lootMaster);
++  if ( _player->m_playerInfo->guid == lootMaster || !plr) {
++    Group* pGroup = _player->GetGroup();
++    if ( !pGroup ) return;
++    pGroup->SetLooter(_player, lootMethod, threshold );
++  }
++  else {
++    Group* pGroup = plr->GetGroup();
++    if ( !pGroup ) return;
++    pGroup->SetLooter(plr, lootMethod, threshold );
++  }*/
++} 
++
++void Session::HandleMinimapPingOpcode(WorldPacket & pck)
++{ 
++	RPlayerInfo * _player;
++
++	if (!GetPlayer())
++		return;
++	else
++		_player = GetPlayer();	
++
++	BG_CHECK
++
++	CHECK_PACKET_SIZE(pck, 8);
++
++	if(!_player->m_Group)
++		return;
++
++	Group * party= _player->m_Group;
++
++	if(!party)
++		return;
++
++	float x,y;
++	pck >> x >> y;
++	WorldPacket data;
++	data.SetOpcode(MSG_MINIMAP_PING);
++	data << uint64(_player->Guid);
++	data << x << y;
++	for(int32 i = 0; i < 1 + 7 * party->groupType; ++i)
++		for(uint32 j = 0; j < 5; ++j)
++		{	
++			if (sClientMgr.GetRPlayer(party->members[i][j]))
++				sClientMgr.GetSession(sClientMgr.GetRPlayer(party->members[i][j])->Sessid)->SendPacket(&data);	
++		}
++} 
++void Session::HandleConvertGroupToRaidOpcode(WorldPacket & pck)
++{ 
++	RPlayerInfo * _player;
++
++	if (!GetPlayer())
++		return;
++	else
++		_player = GetPlayer();
++
++	BG_CHECK
++
++	// This is just soooo easy now   
++	Group *pGroup = _player->m_Group;
++	if(!pGroup)
++		return;
++
++	if ( pGroup->leader != _player->Guid )   //access denied
++	{
++		SendPartyCommandResult(_player, 0, "", ERR_PARTY_YOU_ARE_NOT_LEADER);
++		return;
++	}
++
++	pGroup->groupType = GROUP_TYPE_RAID;
++	SendPartyCommandResult(_player, 0, "", ERR_PARTY_NO_ERROR);
++	GroupUpdate();
++} 
++ 
++void Session::HandleGroupChangeSubGroup(WorldPacket & pck)
++{ 
++	RPlayerInfo * _player;
++
++	if (!GetPlayer())
++		return;
++	else
++		_player = GetPlayer();
++
++	BG_CHECK
++
++	std::string name;
++	uint8 subGroup;
++
++	pck >> name;
++	pck >> subGroup;
++
++	uint32 inf = sClientMgr.GetPlayerGuid(name);
++	--subGroup;
++	
++	if(!inf || !_player->m_Group || subGroup > 7)
++		return;
++
++	Group * g = _player->m_Group;
++
++	if (g->groupType != GROUP_TYPE_RAID)
++		return;
++	
++	for(int32 i = 0; i < 8; ++i)
++		for(uint32 j = 0; j < 5; ++j)
++		{	
++			if (g->members[i][j] == inf)
++			{
++				for(uint32 l = 0; l < 5; ++l)				
++				{
++					if (g->members[subGroup][l] == 0)
++					{
++						g->members[subGroup][l] = inf;
++						g->members[i][j] = 0;
++						GroupUpdate();
++						return;
++					}
++				}
++				//megai2: занято! делаем свап
++				uint32 tmp = g->members[subGroup][0];
++				g->members[subGroup][0] = inf;
++				g->members[i][j] = tmp;
++				GroupUpdate();
++				return;
++			}	
++		}
++} 
++ 
++void Session::HandleGroupAssistantLeader(WorldPacket & pck)
++{ 
++	uint64 guid;
++	uint8 on;
++
++	RPlayerInfo * _player;
++
++	if (!GetPlayer())
++		return;
++	else
++		_player = GetPlayer();
++
++	BG_CHECK
++
++	if(_player->m_Group == NULL)
++		return;
++
++	if ( _player->Guid != _player->m_Group->leader )   //access denied
++	{
++		SendPartyCommandResult(_player, 0, "", ERR_PARTY_YOU_ARE_NOT_LEADER);
++		return;
++	}
++
++	pck  >> guid >> on;
++
++	if(on == 0)
++	{
++		_player->m_Group->mAssist = 0;
++	}
++	else
++	{
++		RPlayerInfo * np = sClientMgr.GetRPlayer((uint32)guid);
++		if(np==NULL)
++			_player->m_Group->mAssist = 0;
++		else
++		{
++			if(_player->m_Group == np->m_Group)
++				_player->m_Group->mAssist = uint32(guid);
++		}
++	}
++	GroupUpdate();
++} 
++ 
++void Session::HandleRequestRaidInfoOpcode(WorldPacket & pck)
++{ 
++
++} 
++ 
++void Session::HandleReadyCheckOpcode(WorldPacket & pck)
++{ 
++	RPlayerInfo * _player;
++
++	if (!GetPlayer())
++		return;
++	else
++		_player = GetPlayer();
++
++	BG_CHECK
++
++	Group * pGroup  = _player->m_Group;
++
++	if(!pGroup)
++		return;
++
++	if(pck.size() == 0)
++	{
++		if(pGroup->leader == _player->Guid)
++		{
++			WorldPacket data(MSG_RAID_READY_CHECK, 8);
++			data << (uint64)GetPlayer()->Guid;
++			/* send packet to group */
++			for(int32 i = 0; i < 1 + 7 * pGroup->groupType; ++i)
++				for(uint32 j = 0; j < 5; ++j)
++				{	
++					if (sClientMgr.GetRPlayer(pGroup->members[i][j]))
++						sClientMgr.GetSession(sClientMgr.GetRPlayer(pGroup->members[i][j])->Sessid)->SendPacket(&data);	
++				}			
++		}
++	}
++	else
++	{
++		uint8 ready;
++		pck >> ready;
++
++		WorldPacket data(MSG_RAID_READY_CHECK_CONFIRM, 9);
++		data << (uint64)_player->Guid;
++		data << ready;
++
++		if(pGroup->leader && sClientMgr.GetRPlayer(pGroup->leader))
++			sClientMgr.GetSession(sClientMgr.GetRPlayer(pGroup->leader)->Sessid)->SendPacket(&data);	
++	}
++} 
++ 
++void Session::HandleSetPlayerIconOpcode(WorldPacket & pck)
++{ 
++	uint64 guid;
++	uint8 icon;
++	RPlayerInfo * _player;
++
++	if (!GetPlayer())
++		return;
++	else
++		_player = GetPlayer();
++
++	BG_CHECK
++
++	// This is just soooo easy now   
++	Group *pGroup = _player->m_Group;
++	if(!pGroup)
++		return;
++
++	pck >> icon;
++
++	if(icon == 0xFF)
++	{
++		// client request
++		WorldPacket data(MSG_RAID_TARGET_UPDATE, 73);
++		data << uint8(1);
++		for(uint8 i = 0; i < 8; ++i)
++			data << i << pGroup->targetIcons[i];
++
++		SendPacket(&data);
++	}
++	else if(_player->Guid == pGroup->leader)
++	{
++		pck >> guid;
++		if(icon > 7)
++			return;			// whhopes,buffer overflow :p
++
++		// setting icon
++		WorldPacket data(MSG_RAID_TARGET_UPDATE, 10);
++		data << uint8(0) << icon << guid;
++
++		for(int32 i = 0; i < 1 + 7 * pGroup->groupType; ++i)
++			for(uint32 j = 0; j < 5; ++j)
++			{	
++				if (sClientMgr.GetRPlayer(pGroup->members[i][j]))
++					sClientMgr.GetSession(sClientMgr.GetRPlayer(pGroup->members[i][j])->Sessid)->SendPacket(&data);	
++			}
++
++		pGroup->targetIcons[icon] = uint32(guid);
++	}
++} 
++ 
++void Session::HandlePartyMemberStatsOpcode(WorldPacket & pck)
++{ 
++	RPlayerInfo * _player;
++
++	if (!GetPlayer())
++		return;
++	else
++		_player = GetPlayer();
++
++	BG_CHECK
++
++	uint64 guid;
++	pck >> guid;
++
++	RPlayerInfo * plr = sClientMgr.GetRPlayer(uint32(guid));
++
++	if(!_player->m_Group || !plr)
++		return;
++
++	WorldPacket data(200);
++	if(_player->m_Group != plr->m_Group)
++		return;			// invalid player
++
++
++	data.Initialize(ISMSG_PARTY_UPDATE);
++	data << PUT_OTHER_TO_SELF;
++
++	data << uint32(guid);
++	data << _player->Sessid;
++	
++	if (sClientMgr.GetSession(plr->Sessid)->GetServer())
++		sClientMgr.GetSession(plr->Sessid)->GetServer()->SendPacket(&data);
++} 
++ 
++void Session::HandleGroupPromote(WorldPacket & pck)
++{ 
++
++} 
++
++void Session::HandleDungeonDifficultyOpcode(WorldPacket& pck)
++{
++	RPlayerInfo * _player;
++
++	if (!GetPlayer())
++		return;
++	else
++		_player = GetPlayer();
++
++	BG_CHECK
++
++    uint32 data;
++    pck >> data;
++
++	if (data > NUM_INSTANCE_MODES - 1)
++		return;
++
++	Group * m_Group = _player->m_Group;
++
++	if(m_Group && m_Group->leader == _player->Guid)
++    {
++		m_Group->difficulty = data;
++
++		WorldPacket pack(MSG_SET_DUNGEON_DIFFICULTY, 12);
++		pack << (uint32)m_Group->difficulty;
++		pack << (uint32)0x1;
++		pack << (uint32)1;
++       
++		for(int32 i = 0; i < 8; ++i)
++			for(uint32 j = 0; j < 5; ++j)
++			{
++				if (!m_Group->members[i][j] || !sClientMgr.GetRPlayer(m_Group->members[i][j]))
++					continue;
++
++				sClientMgr.GetSession(sClientMgr.GetRPlayer(m_Group->members[i][j])->Sessid)->SendPacket(&pack);
++			}
++		
++		GroupUpdate();
++
++    }
++	else if(!_player->m_Group)
++    {
++		WorldPacket data(MSG_SET_DUNGEON_DIFFICULTY, 12);
++		data << (uint32)0;
++		data << (uint32)0x1;
++		data << (uint32)0;
++		SendPacket(&data);
++    }
++
++#ifdef OPTIMIZED_PLAYER_SAVING
++	_player->save_InstanceType();
++#endif
++}
++
++void Session::SendPartyCommandResult(RPlayerInfo* pPlayer, uint32 p1, std::string name, uint32 err)
++{
++	// if error message do not work, please sniff it and leave me a message
++	if(pPlayer)
++	{
++		WorldPacket data;
++		data.Initialize(SMSG_PARTY_COMMAND_RESULT);
++		data << p1;
++		if(!name.length())
++			data << uint8(0);
++		else
++			data << name.c_str();
++
++		data << err;
++		sClientMgr.GetSession(pPlayer->Sessid)->SendPacket(&data);
++	}
++}
++ 
+\ No newline at end of file
+Index: Master.cpp
+===================================================================
+--- Master.cpp	(revision 824)
++++ Master.cpp	(working copy)
+@@ -19,55 +19,344 @@
+ 
+ #include "RStdAfx.h"
+ #include "../arcemu-shared/svn_revision.h"
++#include <signal.h>
+ 
+ Database * Database_Character;
+ Database * Database_World;
++bool m_stopEvent;
++ServerConf sConfig;
++GuidInfo sGuidInfo;
++#ifdef STAT_SYS
++std::string realmName="not defined";
++uint32 procCnt = 0;
++uint32 startTime = GetTickCount();
++uint32 TotalProcTime = 0;
++#endif
+ 
+-int main(int argc, char *argv[])
++void _OnSignal(int s)
+ {
+-	/* Initialize global timestamp */
+-	UNIXTIME = time(NULL);
+-	g_localTime = *localtime(&UNIXTIME);
++	switch (s)
++	{
++#ifndef WIN32
++	case SIGHUP:
++		sWorld.Rehash(true);
++		break;
++#endif
++	case SIGINT:
++	case SIGTERM:
++	case SIGABRT:
++#ifdef _WIN32
++	case SIGBREAK:
++#endif
++		m_stopEvent = true;
++		break;
++	}
+ 
+-	sLog.Init(-1, 3);
++	signal(s, _OnSignal);
++}
+ 
+-    /* Print Banner */
+-	Log.Notice("Server", "===============================");
+-	Log.Notice("Server", "| cluster - realm server       |");
+-	Log.Notice("Server", "| rev %04u					 |", BUILD_REVISION);
+-	Log.Notice("Server", "===============================");
+-	Log.Line();
+-	Log.Notice("Config", "Loading Config Files...\n" );
+- 
+-	if( Config.MainConfig.SetSource("configs/arcemu-world.conf") )
+-		Log.Success( "Config", ">> configs/arcemu-world.conf" );
+-	else
++void _HookSignals()
++{
++	signal( SIGINT, _OnSignal );
++	signal( SIGTERM, _OnSignal );
++	signal( SIGABRT, _OnSignal );
++#ifdef _WIN32
++	signal( SIGBREAK, _OnSignal );
++#else
++	signal( SIGHUP, _OnSignal );
++	signal(SIGUSR1, _OnSignal);
++#endif
++}
++
++void _UnhookSignals()
++{
++	signal( SIGINT, 0 );
++	signal( SIGTERM, 0 );
++	signal( SIGABRT, 0 );
++#ifdef _WIN32
++	signal( SIGBREAK, 0 );
++#else
++	signal( SIGHUP, 0 );
++#endif
++
++}
++
++#ifdef STAT_SYS
++void DumpStats()
++{
++	//megai2: dumpit
++
++	std::string filename = "stats.html";
++	Config.MainConfig.GetString("Cluster", "Statfile", &filename);
++
++	FILE* logfile = fopen(filename.c_str(), "w+");
++
++	fprintf(logfile, "<html><head><title>%s statistics</title></head><body style=\"background-color: #EEE; font-family: Courier; font-size: 10pt\">", realmName.c_str());
++	fprintf(logfile, "%s %s realm info</div><br>", "<div style=\" width: 100%; background-color: #888; color: #FFF; text-align: center; font-size: 15pt\">", realmName.c_str());
++	if (startTime != 0)
+ 	{
+-		Log.Error( "Config", ">> configs/arcemu-world.conf" );
+-		return false;
++		uint32 upTime = GetTickCount() - startTime;
++		uint32 dUp = upTime / 86400000;
++		uint32 hUp = (upTime - (dUp * 86400000)) / 3600000;
++                uint32 mUp = (upTime - (hUp * 3600000) - (dUp * 86400000)) / 60000;
++                uint32 sUp = (upTime - (mUp * 60000) - (hUp * 3600000) - (dUp * 86400000)) / 1000;
++		fprintf(logfile, " Uptime: <b> <i> %u d </i> %u h </b> %u m %u s <br>", 
++			dUp, hUp, mUp, sUp);
++	} else {
++		fprintf(logfile, " <div style=\"text-align: center; color: #F55;\">Offline</div> ");
++		return;
+ 	}
++	fprintf(logfile, " Revision: <b> %u %s </b> <br>", BUILD_REVISION, BUILD_TAG);
++	
+ 
+-	if(Config.OptionalConfig.SetSource("configs/arcemu-optional.conf"))
+-		Log.Success( "Config", ">> configs/arcemu-optional.conf");
++	std::string serverPeakColor = "E66";
++
++	if (sClusterMgr.GetServersCount() == 6)
++		serverPeakColor = "6F6";
++	else if (sClusterMgr.GetServersCount() == 4)
++		serverPeakColor = "666";
++	else if (sClusterMgr.GetServersCount() < 4 || sClusterMgr.GetServersCount() > 6)
++		serverPeakColor = "F66";
++
++	fprintf(logfile, " Active workers peak: <span style=\"color: %s ;\"> %u </span> <br>", serverPeakColor.c_str(), sClusterMgr.GetServersCount());
++
++	if (TotalProcTime / procCnt > 50)
++		serverPeakColor = "F66";
+ 	else
++		serverPeakColor = "6F6";
++
++	fprintf(logfile, " Average process time: <span style=\"color: %s \"> %u </span> <br>", serverPeakColor.c_str(), TotalProcTime / procCnt);
++	fprintf(logfile, " Total processes count: %u <br>", procCnt);
++	fprintf(logfile, " Players online: %u <br>", sClientMgr.GetPlayersCount());
++	fprintf(logfile, " Peak players online: %u <br>", sClientMgr.peakOnline);
++	fprintf(logfile, " Active sessions: %u <br>" , sClientMgr.GetSessionsCount());
++
++	bool sOnline = sClusterMgr.GetServerByMapId(0) != NULL;
++
++	if (sOnline)
+ 	{
+-		Log.Error("Config", ">> configs/arcemu-optional.conf");
+-		return false;
++		fprintf(logfile, "Eastern Kingdoms: <span style=\"color: #0F0 \">online</span> latency: %u <br>", sClusterMgr.GetServerByMapId(0)->latency);
++	} else {
++		fprintf(logfile, "Eastern Kingdoms: <span style=\"color: #F00 \"><b>offline</b></span><br>");
+ 	}
+ 
+-	if(Config.RealmConfig.SetSource("configs/arcemu-realms.conf"))
+-		Log.Success( "Config", ">> configs/arcemu-realms.conf" );
+-	else
++	sOnline = sClusterMgr.GetServerByMapId(1) != NULL;
++
++	if (sOnline)
+ 	{
+-		Log.Error( "Config", ">> configs/arcemu-realms.conf" );
+-		return false;
++		fprintf(logfile, "Kalimdor: <span style=\"color: #0F0 \">online</span> latency: %u <br>", sClusterMgr.GetServerByMapId(1)->latency);
++	} else {
++		fprintf(logfile, "Kalimdor: <span style=\"color: #F00 \"><b>offline</b></span><br>");
+ 	}
+ 
+-	new ClusterMgr;
+-	new ClientMgr;
+-	ThreadPool.Startup();
+-	Log.Line();
+-//подключаемся к дб
++	sOnline = sClusterMgr.GetServerByMapId(530) != NULL;
++
++	if (sOnline)
++	{
++		fprintf(logfile, "Outlands: <span style=\"color: #0F0 \">online</span> latency: %u <br>", sClusterMgr.GetServerByMapId(530)->latency);
++	} else {
++		fprintf(logfile, "Outlands: <span style=\"color: #F00 \"><b>offline</b></span><br>");
++	}
++
++	sOnline = sClusterMgr.GetServerByMapId(571) != NULL;
++
++	if (sOnline)
++	{
++		fprintf(logfile, "Northrend: <span style=\"color: #0F0 \">online</span> latency: %u <br>", sClusterMgr.GetServerByMapId(571)->latency);
++	} else {
++		fprintf(logfile, "Northrend: <span style=\"color: #F00 \"><b>offline</b></span><br>");
++	}
++
++	sOnline = sClusterMgr.GetWorkerServerForNewInstance() != NULL;
++
++	if (sOnline)
++	{
++		fprintf(logfile, "Instanced world: <span style=\"color: #0F0 \">online</span> latency: %u <br>", sClusterMgr.GetWorkerServerForNewInstance()->latency);
++	} else {
++		fprintf(logfile, "Instanced world: <span style=\"color: #F00 \"><b>offline</b></span><br>");
++	}
++
++	sOnline = sClusterMgr.GetServerByMapId(450) != NULL;
++
++	if (sOnline)
++	{
++		fprintf(logfile, "Battle world: <span style=\"color: #0F0 \">online</span> latency: %u <br>", sClusterMgr.GetServerByMapId(450)->latency);
++	} else {
++		fprintf(logfile, "Battle world: <span style=\"color: #F00 \"><b>offline</b></span><br>");
++	}
++
++	uint32 actSessions = 0;
++        uint32 sumLat = 0;
++
++	if (sClientMgr.GetSessionsCount() != 0)
++	{
++		fprintf(logfile, "<div style=\" width: 100%s", "%; background-color: #888; color: #FFF; text-align: center; font-size: 15pt\">Sessions info</div>");
++		
++		for(uint32 j = 1; j <= sClientMgr.GetSessionsCount(); ++j)
++		{
++			Session* s = sClientMgr.GetSession(j);
++			if (!s)
++				continue;
++
++			++actSessions;
++			sumLat += s->latency;
++
++			fprintf(logfile, "SID: %u, Acc: %s(%u), Latency: %u; &nbsp&nbsp&nbsp ", 
++				j, s->GetAccountName().c_str(), s->GetAccountId(), s->latency);
++
++			if(s->GetPlayer())
++			{
++				std::string classNames[11] = {
++					"Воин",
++					"Паладин",
++					"Охотник",
++					"Вор",
++					"Жрец",
++					"Рыцарь смерти",
++					"Шаман",
++					"Маг",
++					"Колдун",
++					"<10>"
++					"Друид",
++				};
++
++				std::string raceNames[11] = {
++					"Человек",
++					"Орк",
++					"Дварф",
++					"Ночной эльф",
++					"Нежить",
++					"Таурен",
++					"Гном",
++					"<8>",
++					"<9>",
++					"Кровавый эльф",
++					"Дреней",
++				};
++
++				RPlayerInfo* plr = s->GetPlayer();
++
++				uint32 srvID = 0;
++				uint32 pendID = s->GetTeleportPendingSID();
++				if (s->GetServer())
++					srvID = s->GetServer()->GetID();
++
++				if (s->GetNextServer())
++					pendID = s->GetNextServer()->GetID();
++
++				std::string mapName = "Unknown";
++
++				if (WorldMapInfoStorage.LookupEntry(plr->MapId))
++				{
++					mapName.clear();
++					mapName.append(WorldMapInfoStorage.LookupEntry(plr->MapId)->name);
++				}
++
++				fprintf(logfile, "Player: %s(%u), Class: %s, Race: %s, Level: %u, Guild: %s(%u), Map: %s(%u,%u,%u), Instance: %u<br>",
++					plr->Name.c_str(), plr->Guid, classNames[plr->Class-1].c_str(), 
++					raceNames[plr->Race-1].c_str(), plr->Level, sClientMgr.GetGuildName(plr->GuildId).c_str(), plr->GuildId,
++					mapName.c_str(), plr->MapId, srvID, pendID, plr->InstanceId);
++			} else
++				fprintf(logfile, "<br>");
++		}
++		fprintf(logfile, "Average latency: %u <br>", sumLat / actSessions);
++	}
++
++	fprintf(logfile, "</body></html>");
++
++	fclose(logfile);
++
++}
++#endif
++
++void LoadGuids() 
++{
++
++	sGuidInfo.globalOffset = Config.MainConfig.GetIntDefault("Cluster", "realmId", 1);
++	sGuidInfo.realmsCnt = Config.MainConfig.GetIntDefault("Cluster", "realmsCnt", 8);
++
++	uint32 maxGuid = (GLOBAL_MAX_GUID / sGuidInfo.realmsCnt) * sGuidInfo.globalOffset;
++	uint32 minGuid = (GLOBAL_MAX_GUID / sGuidInfo.realmsCnt) * (sGuidInfo.globalOffset-1);
++	uint32 part = (GLOBAL_MAX_GUID / sGuidInfo.realmsCnt) / MAX_ACTIVE_WS;
++
++	QueryResult *qresult;
++
++	for (int8 i = 0;i<MAX_ACTIVE_WS;++i)
++	{
++		Log.Notice("ObjMgr", "Loading guids for ws %u", i+1);
++
++		qresult = CharacterDatabase.Query( "SELECT MAX(guid) FROM characters WHERE guid > %u AND guid < %u", minGuid + i * part, minGuid + (i + 1) * part);
++		if( qresult )
++		{
++			sGuidInfo.m_hiPlayerGuid[i] = qresult->Fetch()[0].GetUInt32();
++			delete qresult;
++		}
++
++		qresult = CharacterDatabase.Query("SELECT MAX(guid) FROM playeritems WHERE guid > %u AND guid < %u", minGuid + i * part, minGuid + (i + 1) * part);
++		if( qresult )
++		{
++			sGuidInfo.m_hiItemGuid[i] = (uint32)qresult->Fetch()[0].GetUInt32();
++			delete qresult;
++		}
++	
++		qresult = CharacterDatabase.Query("SELECT MAX(guildid) FROM guilds WHERE guildid > %u AND guildid < %u", minGuid + i * part, minGuid + (i + 1) * part);
++		if( qresult )
++		{
++			sGuidInfo.m_hiGuildGuid[i] = (uint32)qresult->Fetch()[0].GetUInt32();
++			delete qresult;
++		}
++		
++		qresult = CharacterDatabase.Query("SELECT MAX(message_id) FROM mailbox WHERE message_id > %u AND message_id < %u", minGuid + i * part, minGuid + (i + 1) * part);
++		if( qresult )
++		{
++			sGuidInfo.m_mailGuid[i] = (uint32)qresult->Fetch()[0].GetUInt32();
++			delete qresult;
++		}
++		
++		qresult = CharacterDatabase.Query("SELECT MAX(auctionId) FROM auctions WHERE auctionId > %u AND auctionId < %u", minGuid + i * part, minGuid + (i + 1) * part);
++		if ( qresult )
++		{
++			sGuidInfo.m_auctionGuid[i] = (uint32)qresult->Fetch()[0].GetUInt32();
++			delete qresult;
++		}
++
++		if (sGuidInfo.m_hiPlayerGuid[i] < minGuid + i * part)
++			sGuidInfo.m_hiPlayerGuid[i] = minGuid + i * part;
++
++		if (sGuidInfo.m_hiItemGuid[i] < minGuid + i * part)
++			sGuidInfo.m_hiItemGuid[i] = minGuid + i * part;
++
++		if (sGuidInfo.m_hiGuildGuid[i] < minGuid + i * part)
++			sGuidInfo.m_hiGuildGuid[i] = minGuid + i * part;
++
++		if (sGuidInfo.m_mailGuid[i] < minGuid + i * part)
++			sGuidInfo.m_mailGuid[i] = minGuid + i * part;
++
++		if (sGuidInfo.m_auctionGuid[i] < minGuid + i * part)
++			sGuidInfo.m_auctionGuid[i] = minGuid + i * part;
++
++		Log.Success("ObjMgr", "item higuid: %u", sGuidInfo.m_hiItemGuid[i]);
++		Log.Success("ObjMgr", "char higuid: %u", sGuidInfo.m_hiPlayerGuid[i]);
++		Log.Success("ObjMgr", "guild higuid: %u", sGuidInfo.m_hiGuildGuid[i]);
++		Log.Success("ObjMgr", "cont higuid: %u", sGuidInfo.m_hiContainerGuid[i]);
++		Log.Success("ObjMgr", "mail higuid: %u", sGuidInfo.m_mailGuid[i]);
++		Log.Success("ObjMgr", "auction higuid: %u", sGuidInfo.m_auctionGuid[i]);
++	}
++
++	//megai2: не учитываем бг группы
++	qresult = CharacterDatabase.Query("SELECT MAX(group_id) FROM groups WHERE group_id < 2147483647");
++	if( qresult )
++	{
++		sGuidInfo.m_hiGroupGuid = (uint32)qresult->Fetch()[0].GetUInt32();
++		delete qresult;
++	}
++
++	Log.Success("ObjMgr", "group higuid: %u", sGuidInfo.m_hiGroupGuid);
++}
++
++bool InitDB()
++{
++	//подключаемся к дб
+ 	Database_World=NULL;
+ 	Database_Character=NULL;
+ 	string hostname, username, password, database;
+@@ -87,19 +376,19 @@
+ 	Database_World = Database::CreateDatabaseInterface(type);
+ 
+ 	if(result == false)
+- 	{
++	{
+ 		Log.Error( "sql","One or more parameters were missing from WorldDatabase directive." );
+ 		return false;
+- 	}
++	}
+ 
+ 	// Initialize it
+ 	if( !WorldDatabase.Initialize(hostname.c_str(), (unsigned int)port, username.c_str(),
+-		password.c_str(), database.c_str(), Config.MainConfig.GetIntDefault( "WorldDatabase", "ConnectionCount", 3 ), 16384 ) )
+- 	{
++		password.c_str(), database.c_str(), 5, 16384 ) )
++	{
+ 		Log.Error( "sql","Main database initialization failed. Exiting." );
+ 		return false;
+- 	}
+- 
++	}
++
+ 	result = Config.MainConfig.GetString( "CharacterDatabase", "Username", &username );
+ 	Config.MainConfig.GetString( "CharacterDatabase", "Password", &password );
+ 	result = !result ? result : Config.MainConfig.GetString( "CharacterDatabase", "Hostname", &hostname );
+@@ -116,38 +405,119 @@
+ 
+ 	// Initialize it
+ 	if( !CharacterDatabase.Initialize( hostname.c_str(), (unsigned int)port, username.c_str(),
+-		password.c_str(), database.c_str(), Config.MainConfig.GetIntDefault( "CharacterDatabase", "ConnectionCount", 5 ), 16384 ) )
++		password.c_str(), database.c_str(), 8, 16384 ) )
+ 	{
+ 		Log.Error( "sql","Main database initialization failed. Exiting." );
+ 		return false;
+ 	}
+ 
+ 	Log.Line();
++	return true;
++}
+ 
++int run(int argc, char *argv[])
++{
++	UNIXTIME = time(NULL);
++	g_localTime = *localtime(&UNIXTIME);
++
++	sLog.Init(1, 1);
++
++    /* Print Banner */
++	Log.Notice("Server", "Cluster - Realm Server r%u", BUILD_REVISION);
++	Log.Line();
++
++	Log.Notice("Config", "Loading Config Files...\n" );
++
++	if( Config.MainConfig.SetSource("configs/arcemu-world.conf") )
++		Log.Success( "Config", ">> configs/arcemu-world.conf" );
++	else
++	{
++		Log.Error( "Config", ">> configs/arcemu-world.conf" );
++		return false;
++	}
++
++	if(Config.OptionalConfig.SetSource("configs/arcemu-optional.conf"))
++		Log.Success( "Config", ">> configs/arcemu-optional.conf");
++	else
++	{
++		Log.Error("Config", ">> configs/arcemu-optional.conf");
++		return false;
++	}
++
++	if(Config.RealmConfig.SetSource("configs/arcemu-realms.conf"))
++		Log.Success( "Config", ">> configs/arcemu-realms.conf" );
++	else
++	{
++		Log.Error( "Config", ">> configs/arcemu-realms.conf" );
++		return false;
++	}
++
++	new ClusterMgr;
++	new ClientMgr;
++	ThreadPool.Startup();
++	ThreadPool.IntegrityCheck();
++	SetThreadName( "Main Thread" );
++	Log.Line();
++
++	if (!InitDB())
++	{
++		Log.Error("Startup", "Database init failed, exiting");
++		return -1;
++	};
++
++	sLog.Init(Config.MainConfig.GetIntDefault("LogLevel", "File", 1), Config.MainConfig.GetIntDefault("LogLevel", "Screen", 1));
++	Log.log_level = Config.MainConfig.GetIntDefault("LogLevel", "Screen", 1);
++
++	Storage_Load();
+ 	Log.Success("Storage", "DBC Files Loaded...");
+-	Storage_Load();
+ 
+ 	Log.Line();
+-	//CreateSocketEngine();
+-	//sSocketEngine.SpawnThreads();
++
++	//megai2: грузим конфиги
++	sConfig.interfaction_chat = Config.OptionalConfig.GetBoolDefault("Interfaction", "InterfactionChat", false);
++	sConfig.interfaction_group = Config.OptionalConfig.GetBoolDefault("Interfaction", "InterfactionGroup", false);
++
+ 	new SocketMgr;
+ 	new SocketGarbageCollector;
+ 	sSocketMgr.SpawnWorkerThreads();
+ 
++	new AddonMgr;
++
++	sClientMgr.LoadGuildNames();//megai2: really shit!
++	sClientMgr.LoadPlayerNames();
++	sClientMgr.LoadGroups();//megai2: load it
++
++	LoadGuids();
++
++	/* connect to LS */
++	new LogonCommHandler;
++	sLogonCommHandler.Startup();
++
++	/* main loop */
++
++	uint32 integrCheckTmr = 0;
++	m_stopEvent = false;
++	std::string hostname;
++
+ 	Log.Success("Network", "Network Subsystem Started.");
++	Log.Notice("Network", "Opening Client Port...");
+ 
+-	Log.Notice("Network", "Opening Client Port...");
+ 	Config.MainConfig.GetString("Listen", "Host", &hostname);
+-	ListenSocket<WorldSocket> * wsl = new ListenSocket<WorldSocket>(hostname.c_str(), 8129);
++
++	ListenSocket<WorldSocket> * wsl = new ListenSocket<WorldSocket>(hostname.c_str(), Config.MainConfig.GetIntDefault("Listen", "WorldServerPort", 8129));
+ 	bool lsc = wsl->IsOpen();
+-	if( lsc )
++	if( lsc ){
+ 		ThreadPool.ExecuteTask(wsl);
+-	
++		wsl->SetThreadName("Socket | WorldServerPort");
++	}
+ 	Log.Notice("Network", "Opening Server Port...");
++
+ 	ListenSocket<WSSocket> * isl = new ListenSocket<WSSocket>(hostname.c_str(), 11010);
+ 	bool ssc = isl->IsOpen();
+-	if( ssc )
++	if( ssc ){
+ 		ThreadPool.ExecuteTask(isl);
++		isl->SetThreadName("Socket | 11010");
++	}
+ 
+ 	if(!lsc || !ssc)
+ 	{
+@@ -155,30 +525,101 @@
+ 		return 1;
+ 	}
+ 
+-	/* connect to LS */
+-	new LogonCommHandler;
+-	sLogonCommHandler.Startup();
++	_HookSignals();
+ 
+-	ThreadPool.IntegrityCheck();
++	ThreadPool.KillFreeThreads(10);
++	HANDLE hThread = GetCurrentThread();
+ 
+-	/* main loop */
+-	for(;;)
++	while(!m_stopEvent)
+ 	{
+-        sLogonCommHandler.UpdateSockets();
++		uint32 start = getMSTime();
+ 		//wsl->Update();
+ 		//isl->Update();
+ 		sClientMgr.Update();
+ 		sClusterMgr.Update();
+-		UNIXTIME=(uint32)time(NULL);
++		UNIXTIME = time(NULL);
+ 		g_localTime = *localtime(&UNIXTIME);
+-		Sleep(50);
++		sSocketGarbageCollector.Update();
++#ifdef STAT_SYS
++		++procCnt;
++#endif
++		++integrCheckTmr;
++		if (integrCheckTmr == 60 * 50) {
++			integrCheckTmr = 0;
++			//megai2: я вот думаю а оно вообще надо нам? =)
++			//sClientMgr.SaveGroups();
++#ifdef STAT_SYS
++			DumpStats();
++#endif
++		}
++		uint32 procTime = getMSTime() - start;
++#ifdef STAT_SYS
++		TotalProcTime += procTime;
++#endif
++		if (50 > procTime)
++			WaitForSingleObject(hThread, (50 - procTime));
+ 	}
+ 
++#ifdef STAT_SYS
++	startTime = 0;
++	DumpStats();
++#endif	
++
++	_UnhookSignals();
++	
++	// begin server shutdown
++	Log.Notice( "Shutdown", "Initiated at %s", ConvertTimeStampToDataTime( (uint32)UNIXTIME).c_str() );
++
++	// send a query to wake it up if its inactive
++	Log.Notice( "Database", "Clearing all pending queries..." );
++
++	// kill the database thread first so we don't lose any queries/data
++	Database_Character->EndThreads();
++	Database_World->EndThreads();
++
++	Log.Notice( "Network", "Shutting down network subsystem." );
++
++	wsl->Close();
++	Sleep(200);
++	delete wsl;
++
++	isl->Close();
++	Sleep(200);
++	delete isl;
++
++#ifdef WIN32
++	sSocketMgr.ShutdownThreads();
++#endif
++	sSocketMgr.CloseAll();
++
++	ThreadPool.Shutdown();
++
++	delete LogonCommHandler::getSingletonPtr();
++
++	Log.Notice( "Database", "Closing Connections..." );
++	if (Database_World != NULL)
++	delete Database_World;
++	if (Database_Character != NULL)
++	delete Database_Character;
++	Database::CleanupLibs();
++
++	Log.Notice( "Network", "Deleting Network Subsystem..." );
++	delete SocketMgr::getSingletonPtr();
++	delete SocketGarbageCollector::getSingletonPtr();
++
++	Log.Success( "Shutdown", "Shutdown complete." );
++
++	return 0;
+ }
+ 
++int main(int argc, char *argv[])
++{
++	THREAD_TRY_EXECUTION2
++	run(argc, argv);
++	THREAD_HANDLE_CRASH2
++}
++
+ void OnCrash(bool Terminate)
+ {
+-
++	printf("shit ><");
+ }
+-
+-
+Index: AddonMgr.cpp
+===================================================================
+--- AddonMgr.cpp	(revision 0)
++++ AddonMgr.cpp	(working copy)
+@@ -0,0 +1,262 @@
++/*
++ * ArcEmu MMORPG Server
++ * Copyright (C) 2005-2007 Ascent Team <http://www.ascentemu.com/>
++ * Copyright (C) 2008 <http://www.ArcEmu.org/>
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU Affero General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Affero General Public License for more details.
++ *
++ * You should have received a copy of the GNU Affero General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ *
++ */
++
++#include "RStdAfx.h"
++
++initialiseSingleton( AddonMgr );
++
++//#define DEBUG_PRINT_ADDON_PACKET			// Prints out Received addon packet when char logging in
++
++// hacky key
++static uint8 PublicKey[265] = { 0x02, 0x01, 0x01, 0xC3, 0x5B, 0x50, 0x84, 0xB9, 0x3E, 0x32, 0x42, 0x8C, 0xD0, 0xC7, 0x48, 0xFA, 0x0E, 0x5D, 0x54, 0x5A, 0xA3, 0x0E, 0x14, 0xBA, 0x9E, 0x0D, 0xB9, 0x5D, 0x8B, 0xEE, 0xB6, 0x84, 0x93, 0x45, 0x75, 0xFF, 0x31, 0xFE, 0x2F, 0x64, 0x3F, 0x3D, 0x6D, 0x07, 0xD9, 0x44, 0x9B, 0x40, 0x85, 0x59, 0x34, 0x4E, 0x10, 0xE1, 0xE7, 0x43, 0x69, 0xEF, 0x7C, 0x16, 0xFC, 0xB4, 0xED, 0x1B, 0x95, 0x28, 0xA8, 0x23, 0x76, 0x51, 0x31, 0x57, 0x30, 0x2B, 0x79, 0x08, 0x50, 0x10, 0x1C, 0x4A, 0x1A, 0x2C, 0xC8, 0x8B, 0x8F, 0x05, 0x2D, 0x22, 0x3D, 0xDB, 0x5A, 0x24, 0x7A, 0x0F, 0x13, 0x50, 0x37, 0x8F, 0x5A, 0xCC, 0x9E, 0x04, 0x44, 0x0E, 0x87, 0x01, 0xD4, 0xA3, 0x15, 0x94, 0x16, 0x34, 0xC6, 0xC2, 0xC3, 0xFB, 0x49, 0xFE, 0xE1, 0xF9, 0xDA, 0x8C, 0x50, 0x3C, 0xBE, 0x2C, 0xBB, 0x57, 0xED, 0x46, 0xB9, 0xAD, 0x8B, 0xC6, 0xDF, 0x0E, 0xD6, 0x0F, 0xBE, 0x80, 0xB3, 0x8B, 0x1E, 0x77, 0xCF, 0xAD, 0x22, 0xCF, 0xB7, 0x4B, 0xCF, 0xFB, 0xF0, 0x6B, 0x11, 0x45, 0x2D, 0x7A, 0x81, 0x18, 0xF2, 0x92, 0x7E, 0x98, 0x56, 0x5D, 0x5E, 0x69, 0x72, 0x0A, 0x0D, 0x03, 0x0A, 0x85, 0xA2, 0x85, 0x9C, 0xCB, 0xFB, 0x56, 0x6E, 0x8F, 0x44, 0xBB, 0x8F, 0x02, 0x22, 0x68, 0x63, 0x97, 0xBC, 0x85, 0xBA, 0xA8, 0xF7, 0xB5, 0x40, 0x68, 0x3C, 0x77, 0x86, 0x6F, 0x4B, 0xD7, 0x88, 0xCA, 0x8A, 0xD7, 0xCE, 0x36, 0xF0, 0x45, 0x6E, 0xD5, 0x64, 0x79, 0x0F, 0x17, 0xFC, 0x64, 0xDD, 0x10, 0x6F, 0xF3, 0xF5, 0xE0, 0xA6, 0xC3, 0xFB, 0x1B, 0x8C, 0x29, 0xEF, 0x8E, 0xE5, 0x34, 0xCB, 0xD1, 0x2A, 0xCE, 0x79, 0xC3, 0x9A, 0x0D, 0x36, 0xEA, 0x01, 0xE0, 0xAA, 0x91, 0x20, 0x54, 0xF0, 0x72, 0xD8, 0x1E, 0xC7, 0x89, 0xD2, 0x00, 0x00, 0x00, 0x00, 0x00};
++
++AddonMgr::AddonMgr()
++{
++	KnownAddons.clear();
++}
++
++AddonMgr::~AddonMgr()
++{
++	std::map<std::string, AddonEntry*>::iterator itr;
++	for(itr = KnownAddons.begin(); itr!=KnownAddons.end(); ++itr) 
++	{
++		delete itr->second;
++	}
++	KnownAddons.clear();
++}
++
++bool AddonMgr::IsAddonBanned(uint64 crc, std::string name)
++{
++	return false;	// bleh needs work
++}
++
++bool AddonMgr::IsAddonBanned(std::string name, uint64 crc)
++{
++	std::map<std::string,AddonEntry*>::iterator i = KnownAddons.find(name);
++	if(i != KnownAddons.end())
++	{
++		if(i->second->banned)
++		{
++			sLog.outDebug("Addon %s is banned.", name.c_str());
++			return true;
++		}
++	}
++	else
++	{
++		// New addon. It'll be saved to db at server shutdown.
++		AddonEntry *ent = new AddonEntry;
++		ent->name = name;
++		ent->crc = crc;
++		ent->banned = false;	// by default.. we can change this I guess..
++		ent->isNew = true;
++		ent->showinlist = true;
++
++		sLog.outDebug("Discovered new addon %s sent by client.", name.c_str());
++
++		KnownAddons[ent->name] = ent;
++	}
++
++	return false;
++}
++
++bool AddonMgr::ShouldShowInList(std::string name)
++{
++	std::map<std::string,AddonEntry*>::iterator i = KnownAddons.find(name);
++	if(i != KnownAddons.end())
++	{
++		if(i->second->showinlist)
++			return true;
++		else
++			return false;
++	}
++	else
++	{
++		// New addon. It'll be saved to db at server shutdown.		
++		AddonEntry *ent = new AddonEntry;
++		ent->name = name;
++		ent->crc = 0;
++		ent->banned = false;	// by default.. we can change this I guess..
++		ent->isNew = true;
++		ent->showinlist = true;
++
++		sLog.outDebug("Discovered new addon %s sent by client.", name.c_str());
++
++		KnownAddons[ent->name] = ent;
++	}
++
++	return true;
++}
++
++void AddonMgr::SendAddonInfoPacket(WorldPacket *source, uint32 pos, Session *m_session)
++{
++	WorldPacket returnpacket;
++	returnpacket.Initialize(SMSG_ADDON_INFO);	// SMSG_ADDON_INFO
++
++	uint32 realsize;
++	uLongf rsize;
++	try
++	{
++		*source >> realsize;
++	}
++	catch (ByteBuffer::error &)
++	{
++		sLog.outDebug("Warning: Incomplete auth session sent.");
++		return;
++	}	
++	rsize = realsize;
++	size_t position = source->rpos();
++
++	ByteBuffer unpacked;
++	unpacked.resize(realsize);
++
++	if((source->size() - position) < 4 || realsize == 0)
++	{
++		// we shouldnt get here.. but just in case this will stop any crash here.
++		sLog.outDebug("Warning: Incomplete auth session sent.");
++		return;
++	}
++	int32 result;
++	result = uncompress((uint8*)unpacked.contents(), &rsize, (uint8*)(*source).contents() + position, (uLong)((*source).size() - position));
++
++	if(result != Z_OK)
++	{
++		sLog.outError("Decompression of addon section of CMSG_AUTH_SESSION failed.");
++		return;
++	}
++
++	sLog.outDetail("Decompression of addon section of CMSG_AUTH_SESSION succeeded.");
++	
++	uint32 unk;//megai2: возможно количество аддонов
++	unpacked >> unk;
++	uint8 Enable; // based on the parsed files from retool
++	uint32 crc;
++	uint32 unknown;
++	std::string name;
++
++	size_t p = unpacked.rpos();
++	while(p != unpacked.size() - 4)	// make sure theres always room, otherwise *BAM* crash.
++	{
++		unpacked >> name;
++		unpacked >> Enable;
++		unpacked >> crc;
++		unpacked >> unknown;
++		
++		// Hacky fix, Yea I know its a hacky fix I will make a proper handler one's I got the crc crap
++		if (crc != 0x4C1C776D) // CRC of public key version 2.0.1
++			returnpacket.append(PublicKey,264); // part of the hacky fix
++		else
++			returnpacket << uint8(0x02) << uint8(0x01) << uint8(0x00) << uint32(0) << uint8(0);
++		/*if(!AppendPublicKey(returnpacket, name, crc))
++			returnpacket << uint8(1) << uint8(0) << uint8(0);*/
++
++		p = unpacked.rpos();
++	}
++	//megai2: ещё одно
++	unpacked >> unk;
++	m_session->SendPacket(&returnpacket);
++}
++
++bool AddonMgr::AppendPublicKey(WorldPacket& data, string AddonName, uint32 CRC)
++{
++	if(CRC == 0x4C1C776D)
++	{
++		// Open public key file with that addon
++		map<string, ByteBuffer>::iterator itr = AddonData.find(AddonName);
++		if(itr != AddonData.end())
++			data.append(itr->second);
++		else
++		{
++			// open the file
++			char path[500];
++			snprintf(path, 500, "addons\\%s.pub", AddonName.c_str());
++			FILE * f = fopen(path, "rb");
++			if(f != 0)
++			{
++				// read the file into a bytebuffer
++				ByteBuffer buf;
++				fseek(f, 0, SEEK_END);
++				uint32 length = 264/*ftell(f)*/;
++				fseek(f, 0, SEEK_SET);
++				buf.resize(length);
++				fread((void*)buf.contents(), length, 1, f);
++				fclose(f);
++
++				AddonData[AddonName] = buf;
++				data.append(buf);
++			}
++			else
++			{
++				ByteBuffer buf;
++				buf.append(PublicKey, 264);
++				AddonData[AddonName] = buf;
++				data.append(buf);
++			}
++		}
++		return true;
++	}
++	return false;
++}
++
++void AddonMgr::LoadFromDB()
++{
++	QueryResult *result = WorldDatabase.Query("SELECT * FROM clientaddons");
++	if(!result)
++	{
++		sLog.outString("Query failed: SELECT * FROM clientaddons");
++		return;
++	}
++
++	do 
++	{
++		Field *field = result->Fetch();
++		AddonEntry *ent = new AddonEntry;
++
++		ent->name = field[1].GetString();
++		ent->crc = field[2].GetUInt64();
++		ent->banned = (field[3].GetUInt32()>0? true:false);
++		ent->isNew = false;
++		if(result->GetFieldCount() == 5)				// To avoid crashes for stilly nubs who don't update table :P
++			ent->showinlist = (field[4].GetUInt32()>0 ? true : false);
++
++		KnownAddons[ent->name] = ent;
++	} while(result->NextRow());
++
++	delete result;
++}
++
++void AddonMgr::SaveToDB()
++{
++	sLog.outString("AddonMgr: Saving any new addons discovered in this session to database.");
++	for(std::map<std::string, AddonEntry*>::iterator itr = KnownAddons.begin();itr!=KnownAddons.end();++itr)
++	{
++		if(itr->second->isNew)
++		{
++			sLog.outDetail("Saving new addon %s", itr->second->name.c_str());
++			std::stringstream ss;
++			ss << "INSERT INTO clientaddons (name, crc, banned, showinlist) VALUES(\""
++				<< WorldDatabase.EscapeString(itr->second->name) << "\",\""
++				<< itr->second->crc << "\",\""
++				<< itr->second->banned << "\",\""
++				<< itr->second->showinlist << "\");";
++
++			WorldDatabase.Execute(ss.str().c_str());
++		}
++	}
++}

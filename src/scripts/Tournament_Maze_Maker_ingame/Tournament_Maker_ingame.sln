@@ -1,0 +1,26 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 10.00
+# Visual C++ Express 2008
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Tournament_Maze_Maker_ingame", "Tournament_Maker_ingame.vcproj", "{5DD9DDD2-578E-492D-AC89-F7F8609780A1}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		D64|Win32 = D64|Win32
+		Debug|Win32 = Debug|Win32
+		R64|Win32 = R64|Win32
+		Release|Win32 = Release|Win32
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{5DD9DDD2-578E-492D-AC89-F7F8609780A1}.D64|Win32.ActiveCfg = D64|Win32
+		{5DD9DDD2-578E-492D-AC89-F7F8609780A1}.D64|Win32.Build.0 = D64|Win32
+		{5DD9DDD2-578E-492D-AC89-F7F8609780A1}.Debug|Win32.ActiveCfg = Debug|Win32
+		{5DD9DDD2-578E-492D-AC89-F7F8609780A1}.Debug|Win32.Build.0 = Debug|Win32
+		{5DD9DDD2-578E-492D-AC89-F7F8609780A1}.R64|Win32.ActiveCfg = R64|Win32
+		{5DD9DDD2-578E-492D-AC89-F7F8609780A1}.R64|Win32.Build.0 = R64|Win32
+		{5DD9DDD2-578E-492D-AC89-F7F8609780A1}.Release|Win32.ActiveCfg = Release|Win32
+		{5DD9DDD2-578E-492D-AC89-F7F8609780A1}.Release|Win32.Build.0 = Release|Win32
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+EndGlobal
